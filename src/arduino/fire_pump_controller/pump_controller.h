@@ -33,6 +33,42 @@ enum class CommandType : uint8_t {
   STOP,
   START_FAILED,
   RESET_IDLE,
+
+  // Maintenance relay control. Always compiled and always tested; only
+  // *reachable* over HTTP when ENABLE_MAINTENANCE_API is set (see config.h).
+  MAINT_CHOKE_ON,
+  MAINT_CHOKE_OFF,
+  MAINT_STARTER_ON,
+  MAINT_STARTER_OFF,
+  MAINT_KILL_ON,
+  MAINT_KILL_OFF,
+};
+
+// Returns true for the six maintenance command types.
+bool isMaintenanceCommand(CommandType c);
+
+// Timings for one start sequence. Defaults come from config.h; a caller may
+// override them per request via headers on POST /v1/start.
+//
+// crankDurationMs is clamped to MAX_CRANK_MS on construction, so no code path
+// -- including a malformed override that slipped past HTTP validation -- can
+// ask for a longer crank than the hard ceiling.
+struct StartTimings {
+  uint32_t chokePrepMs    = CHOKE_PREP_MS;
+  uint32_t crankMs        = CRANK_DURATION_MS;
+  uint32_t unchokeDelayMs = UNCHOKE_DELAY_MS;
+
+  void clamp() {
+    if (crankMs > MAX_CRANK_MS) {
+      crankMs = MAX_CRANK_MS;
+    }
+    if (chokePrepMs > MAX_CHOKE_PREP_OVERRIDE_MS) {
+      chokePrepMs = MAX_CHOKE_PREP_OVERRIDE_MS;
+    }
+    if (unchokeDelayMs > MAX_UNCHOKE_DELAY_OVERRIDE_MS) {
+      unchokeDelayMs = MAX_UNCHOKE_DELAY_OVERRIDE_MS;
+    }
+  }
 };
 
 enum class FaultCode : uint8_t {
@@ -82,7 +118,13 @@ class PumpController {
 
   // Handle an authenticated state-changing command. `requestId` may be nullptr
   // or empty, in which case idempotency tracking is skipped for this call.
-  CommandResult handleCommand(CommandType type, const char* requestId, uint32_t now);
+  //
+  // `timings` applies only to CommandType::START and is ignored otherwise.
+  // Pass nullptr to use the config.h defaults. Values are clamped to the
+  // configured ceilings before they take effect.
+  CommandResult handleCommand(CommandType type, const char* requestId,
+                              uint32_t now,
+                              const StartTimings* timings = nullptr);
 
   // --- observers -----------------------------------------------------------
 
@@ -98,6 +140,9 @@ class PumpController {
   }
 
   uint32_t cooldownRemainingMs(uint32_t now) const;
+
+  // Timings that the in-flight (or most recent) start sequence is using.
+  const StartTimings& activeTimings() const { return timings_; }
 
   bool starterActive() const { return starterActive_; }
   bool chokeActive() const { return chokeActive_; }
@@ -146,6 +191,8 @@ class PumpController {
   void noteStarterReleased();
 
   bool startPermitted(uint32_t now) const;
+  bool maintenancePermitted() const;
+  bool applyMaintenance(CommandType type);
 
   // Idempotency ring buffer.
   struct CommandRecord {
@@ -176,6 +223,9 @@ class PumpController {
 
   uint32_t starterOnAt_   = 0;
   uint32_t chokeOnAt_     = 0;
+
+  // Timings governing the current start sequence.
+  StartTimings timings_;
 
   uint32_t lastStarterReleaseAt_ = 0;
   bool     starterEverReleased_  = false;

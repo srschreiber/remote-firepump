@@ -23,6 +23,7 @@ sources=(
   "$here/test_http_protocol.cpp"
   "$here/test_api_handler.cpp"
   "$here/test_invariants.cpp"
+  "$here/test_extensions.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"
@@ -42,20 +43,28 @@ common=(
 
 failed=0
 
-# The suite is built and run twice, once at each relay polarity, so the
-# active-low abstraction is proven to be the single point of control.
+# The suite is built and run across the full configuration matrix:
+#   * both relay polarities, so RELAY_ACTIVE_LOW is proven to be the single
+#     point of control rather than assumed to be;
+#   * maintenance API both enabled and disabled, so the flag's effect on
+#     endpoint reachability is proven in each direction.
 for polarity in true false; do
-  if [ "$polarity" = "true" ]; then name="active-low"; else name="active-high"; fi
-  exe="$build/tests_$name"
+  for maint in 1 0; do
+    if [ "$polarity" = "true" ]; then p_name="active-low"; else p_name="active-high"; fi
+    if [ "$maint" = "1" ]; then m_name="maint-on"; else m_name="maint-off"; fi
+    name="$p_name-$m_name"
+    exe="$build/tests_$name"
 
-  echo
-  echo "=== building host tests ($name) ==="
-  "$CXX" "${common[@]}" "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" "${sources[@]}" -o "$exe"
+    echo
+    echo "=== building host tests ($name) ==="
+    "$CXX" "${common[@]}" "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" \
+           "-DENABLE_MAINTENANCE_API=$maint" "${sources[@]}" -o "$exe"
 
-  echo "=== running host tests ($name) ==="
-  if ! "$exe" "$@"; then
-    failed=1
-  fi
+    echo "=== running host tests ($name) ==="
+    if ! "$exe" "$@"; then
+      failed=1
+    fi
+  done
 done
 
 echo
@@ -63,4 +72,4 @@ if [ "$failed" -ne 0 ]; then
   echo "HOST TEST SUITE FAILED"
   exit 1
 fi
-echo "HOST TEST SUITE PASSED (both relay polarities)"
+echo "HOST TEST SUITE PASSED (both polarities x maintenance on/off)"

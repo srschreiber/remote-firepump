@@ -50,6 +50,11 @@ void makeStatusView(StatusView& v,
 
   v.cooldownRemainingMs = pump.cooldownRemainingMs(nowMs);
 
+  const StartTimings& t = pump.activeTimings();
+  v.chokePrepMs = t.chokePrepMs;
+  v.crankMs = t.crankMs;
+  v.unchokeDelayMs = t.unchokeDelayMs;
+
   v.hasLastCommand = pump.hasLastCommand();
   v.lastCommandType = toString(pump.lastCommandType());
   v.lastCommandRequestId = pump.lastCommandRequestId();
@@ -140,7 +145,58 @@ void planResponse(ResponsePlan& out,
 
   const char* requestId = req.requestIdValid ? req.requestId : "";
 
-  const CommandResult result = pump.handleCommand(route.command, requestId, nowMs);
+  // ---- 6. Optional start-sequence timing overrides -------------------------
+  StartTimings timings;                 // config.h defaults
+  const StartTimings* timingArg = nullptr;
+
+  if (req.anyTimingOverride()) {
+    if (route.command != CommandType::START) {
+      emitError(out, 400, "timing_override_not_applicable",
+                "timing override headers are only valid on POST /v1/start",
+                toString(pump.state()), 0, false);
+      return;
+    }
+    if (req.timingMalformed) {
+      emitError(out, 400, "invalid_timing_override",
+                "timing headers must be plain decimal milliseconds",
+                toString(pump.state()), 0, false);
+      return;
+    }
+
+    // Out-of-range values are rejected rather than silently clamped, so the
+    // caller always knows exactly what ran.
+    if (req.chokeMsPresent) {
+      if (req.chokeMs > MAX_CHOKE_PREP_OVERRIDE_MS) {
+        emitError(out, 400, "choke_ms_out_of_range",
+                  "X-Choke-Ms exceeds the configured maximum",
+                  toString(pump.state()), 0, false);
+        return;
+      }
+      timings.chokePrepMs = req.chokeMs;
+    }
+    if (req.crankMsPresent) {
+      if (req.crankMs > MAX_CRANK_MS) {
+        emitError(out, 400, "crank_ms_out_of_range",
+                  "X-Crank-Ms exceeds MAX_CRANK_MS, the hard starter ceiling",
+                  toString(pump.state()), 0, false);
+        return;
+      }
+      timings.crankMs = req.crankMs;
+    }
+    if (req.unchokeMsPresent) {
+      if (req.unchokeMs > MAX_UNCHOKE_DELAY_OVERRIDE_MS) {
+        emitError(out, 400, "unchoke_ms_out_of_range",
+                  "X-Unchoke-Ms exceeds the configured maximum",
+                  toString(pump.state()), 0, false);
+        return;
+      }
+      timings.unchokeDelayMs = req.unchokeMs;
+    }
+    timingArg = &timings;
+  }
+
+  const CommandResult result =
+      pump.handleCommand(route.command, requestId, nowMs, timingArg);
 
   if (!result.accepted) {
     // 409: valid, authenticated, but not permitted from the current state.

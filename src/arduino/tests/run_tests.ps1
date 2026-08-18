@@ -33,6 +33,7 @@ $sources = @(
     (Join-Path $here 'test_http_protocol.cpp'),
     (Join-Path $here 'test_api_handler.cpp'),
     (Join-Path $here 'test_invariants.cpp'),
+    (Join-Path $here 'test_extensions.cpp'),
     (Join-Path $fw   'pump_controller.cpp'),
     (Join-Path $fw   'http_protocol.cpp'),
     (Join-Path $fw   'api_handler.cpp')
@@ -52,20 +53,28 @@ $common = @(
 
 $failed = $false
 
-# The whole suite is built and run twice, once at each relay polarity, so the
-# active-low abstraction is proven to be the single point of control.
+# The suite is built and run across the full configuration matrix:
+#   * both relay polarities, so RELAY_ACTIVE_LOW is proven to be the single
+#     point of control rather than assumed to be;
+#   * maintenance API both enabled and disabled, so the flag's effect on
+#     endpoint reachability is proven in each direction.
 foreach ($polarity in @('true', 'false')) {
-    $name = if ($polarity -eq 'true') { 'active-low' } else { 'active-high' }
-    $exe  = Join-Path $build "tests_$name.exe"
+    foreach ($maint in @('1', '0')) {
+        $pName = if ($polarity -eq 'true') { 'active-low' } else { 'active-high' }
+        $mName = if ($maint -eq '1') { 'maint-on' } else { 'maint-off' }
+        $name  = "$pName-$mName"
+        $exe   = Join-Path $build "tests_$name.exe"
 
-    Write-Host ""
-    Write-Host "=== building host tests ($name) ===" -ForegroundColor Cyan
-    & $cxx @common "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" @sources -o $exe
-    if ($LASTEXITCODE -ne 0) { Write-Error "compilation failed ($name)" }
+        Write-Host ""
+        Write-Host "=== building host tests ($name) ===" -ForegroundColor Cyan
+        & $cxx @common "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" `
+                       "-DENABLE_MAINTENANCE_API=$maint" @sources -o $exe
+        if ($LASTEXITCODE -ne 0) { Write-Error "compilation failed ($name)" }
 
-    Write-Host "=== running host tests ($name) ===" -ForegroundColor Cyan
-    & $exe @args
-    if ($LASTEXITCODE -ne 0) { $failed = $true }
+        Write-Host "=== running host tests ($name) ===" -ForegroundColor Cyan
+        & $exe @args
+        if ($LASTEXITCODE -ne 0) { $failed = $true }
+    }
 }
 
 Write-Host ""
@@ -73,5 +82,5 @@ if ($failed) {
     Write-Host "HOST TEST SUITE FAILED" -ForegroundColor Red
     exit 1
 }
-Write-Host "HOST TEST SUITE PASSED (both relay polarities)" -ForegroundColor Green
+Write-Host "HOST TEST SUITE PASSED (both polarities x maintenance on/off)" -ForegroundColor Green
 exit 0

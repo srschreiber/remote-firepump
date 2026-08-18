@@ -97,6 +97,50 @@ constexpr uint32_t MIN_RECRANK_GAP_MS = 10000;
 // normal operation the state machine releases it far sooner.
 constexpr uint32_t MAX_CHOKE_MS = 30000;
 
+// ---------------------------------------------------------------------------
+// Per-request timing overrides
+// ---------------------------------------------------------------------------
+//
+// POST /v1/start accepts optional X-Choke-Ms / X-Crank-Ms / X-Unchoke-Ms
+// headers. Omitted headers fall back to the defaults above.
+//
+// These are upper bounds on what a caller may request. A request above the
+// bound is rejected with 400 rather than silently clamped, so the caller
+// always knows what actually ran. MAX_CRANK_MS remains enforced independently
+// at the relay layer regardless of what any request asks for.
+constexpr uint32_t MAX_CHOKE_PREP_OVERRIDE_MS    = 15000;
+constexpr uint32_t MAX_UNCHOKE_DELAY_OVERRIDE_MS = 5000;
+
+// The worst-case requestable sequence must still finish inside the choke
+// backstop, or a legal request could fault itself.
+static_assert(MAX_CHOKE_PREP_OVERRIDE_MS + MAX_CRANK_MS +
+                      MAX_UNCHOKE_DELAY_OVERRIDE_MS < MAX_CHOKE_MS,
+              "the longest requestable start sequence must fit inside MAX_CHOKE_MS");
+static_assert(CHOKE_PREP_MS <= MAX_CHOKE_PREP_OVERRIDE_MS,
+              "the default choke prep must be requestable");
+static_assert(UNCHOKE_DELAY_MS <= MAX_UNCHOKE_DELAY_OVERRIDE_MS,
+              "the default unchoke delay must be requestable");
+
+// ---------------------------------------------------------------------------
+// Maintenance relay API
+// ---------------------------------------------------------------------------
+//
+// When enabled, exposes POST /v1/maintenance/{choke,starter,kill}/{on,off}
+// for bench commissioning. OFF BY DEFAULT: direct relay control bypasses the
+// start/stop sequencing that makes the normal API safe.
+//
+// Even when enabled, every hard interlock still applies -- the starter and
+// kill can never be energised together, the starter is still force-released
+// at MAX_CRANK_MS, and the choke is still force-released at MAX_CHOKE_MS.
+// Manual commands are only accepted from IDLE or UNKNOWN.
+//
+// Do not ship this enabled on a controller wired to a real engine.
+#ifndef ENABLE_MAINTENANCE_API
+#define ENABLE_MAINTENANCE_API 0
+#endif
+
+constexpr bool MAINTENANCE_API_ENABLED = (ENABLE_MAINTENANCE_API != 0);
+
 static_assert(CRANK_DURATION_MS <= MAX_CRANK_MS,
               "CRANK_DURATION_MS must not exceed MAX_CRANK_MS");
 static_assert(MAX_CRANK_MS <= 5000,
@@ -130,6 +174,9 @@ constexpr uint32_t WIFI_POLL_INTERVAL_MS = 1000;
 // HTTP request limits. Anything larger is rejected with 413.
 constexpr size_t   HTTP_MAX_REQUEST_LINE = 256;   // "POST /v1/start HTTP/1.1"
 constexpr size_t   HTTP_MAX_HEADER_BYTES = 2048;  // total header section
+// NOTE: keep HTTP_BODY_MAX (http_protocol.h) ahead of the worst-case status
+// document; test `status_json_fits_the_response_buffer_at_maximum_size`
+// fails loudly if a new field ever pushes past it.
 constexpr size_t   HTTP_MAX_LINE_BYTES   = 256;   // any single header line
 
 // A client that cannot get its headers in within this window is dropped.

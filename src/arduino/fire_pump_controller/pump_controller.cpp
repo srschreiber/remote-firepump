@@ -25,13 +25,33 @@ const char* toString(PumpState s) {
 
 const char* toString(CommandType c) {
   switch (c) {
-    case CommandType::NONE:         return "NONE";
-    case CommandType::START:        return "START";
-    case CommandType::STOP:         return "STOP";
-    case CommandType::START_FAILED: return "START_FAILED";
-    case CommandType::RESET_IDLE:   return "RESET_IDLE";
+    case CommandType::NONE:              return "NONE";
+    case CommandType::START:             return "START";
+    case CommandType::STOP:              return "STOP";
+    case CommandType::START_FAILED:      return "START_FAILED";
+    case CommandType::RESET_IDLE:        return "RESET_IDLE";
+    case CommandType::MAINT_CHOKE_ON:    return "MAINT_CHOKE_ON";
+    case CommandType::MAINT_CHOKE_OFF:   return "MAINT_CHOKE_OFF";
+    case CommandType::MAINT_STARTER_ON:  return "MAINT_STARTER_ON";
+    case CommandType::MAINT_STARTER_OFF: return "MAINT_STARTER_OFF";
+    case CommandType::MAINT_KILL_ON:     return "MAINT_KILL_ON";
+    case CommandType::MAINT_KILL_OFF:    return "MAINT_KILL_OFF";
   }
   return "NONE";
+}
+
+bool isMaintenanceCommand(CommandType c) {
+  switch (c) {
+    case CommandType::MAINT_CHOKE_ON:
+    case CommandType::MAINT_CHOKE_OFF:
+    case CommandType::MAINT_STARTER_ON:
+    case CommandType::MAINT_STARTER_OFF:
+    case CommandType::MAINT_KILL_ON:
+    case CommandType::MAINT_KILL_OFF:
+      return true;
+    default:
+      return false;
+  }
 }
 
 const char* toString(EngineStatus e) {
@@ -194,6 +214,9 @@ void PumpController::begin(uint32_t now) {
   faultKillActive_ = false;
   starterEverReleased_ = false;
 
+  // Per-request overrides never survive a reboot.
+  timings_ = StartTimings();
+
   // Never resume an engine operation across a reboot. The controller cannot
   // know whether the engine is running, so it says so.
   state_ = PumpState::UNKNOWN;
@@ -318,7 +341,7 @@ void PumpController::advance(uint32_t now) {
       break;
 
     case PumpState::CHOKING:
-      if (elapsed >= CHOKE_PREP_MS) {
+      if (elapsed >= timings_.chokePrepMs) {
         // Kill must be open before the starter is engaged.
         setKillRelay(false);
         setStarterRelay(true);
@@ -330,7 +353,7 @@ void PumpController::advance(uint32_t now) {
       break;
 
     case PumpState::CRANKING:
-      if (elapsed >= CRANK_DURATION_MS) {
+      if (elapsed >= timings_.crankMs) {
         // Releases the starter and records the exact release instant.
         setStarterRelay(false);
         enterState(PumpState::UNCHOKING);
@@ -338,7 +361,7 @@ void PumpController::advance(uint32_t now) {
       break;
 
     case PumpState::UNCHOKING:
-      if (elapsed >= UNCHOKE_DELAY_MS) {
+      if (elapsed >= timings_.unchokeDelayMs) {
         setChokeRelay(false);
         enterState(PumpState::RUNNING_ASSUMED);
       }
@@ -437,7 +460,55 @@ bool PumpController::isQuiescent() const {
 }
 
 bool PumpController::startPermitted(uint32_t now) const {
-  return state_ == PumpState::IDLE && cooldownRemainingMs(now) == 0;
+  // Every relay must already be at rest. In normal operation IDLE always
+  // satisfies this, so the extra condition changes nothing -- but it closes
+  // the door on a START being layered on top of a manually driven relay left
+  // energised by the maintenance API.
+  return state_ == PumpState::IDLE &&
+         cooldownRemainingMs(now) == 0 &&
+         !starterActive_ && !chokeActive_ && !killActive_;
+}
+
+bool PumpController::maintenancePermitted() const {
+  // Only from a settled state. Never mid-sequence, never from FAULT.
+  return state_ == PumpState::IDLE || state_ == PumpState::UNKNOWN;
+}
+
+bool PumpController::applyMaintenance(CommandType type) {
+  switch (type) {
+    case CommandType::MAINT_CHOKE_ON:
+      setChokeRelay(true);
+      return chokeActive_;
+
+    case CommandType::MAINT_CHOKE_OFF:
+      setChokeRelay(false);
+      return true;
+
+    case CommandType::MAINT_STARTER_ON:
+      // The relay layer refuses and faults if kill is grounded; the caller
+      // is expected to have checked, but this is the authoritative gate.
+      if (killActive_) {
+        return false;
+      }
+      setStarterRelay(true);
+      return starterActive_;
+
+    case CommandType::MAINT_STARTER_OFF:
+      setStarterRelay(false);
+      return true;
+
+    case CommandType::MAINT_KILL_ON:
+      // setKillRelay() releases the starter first, in that order.
+      setKillRelay(true);
+      return killActive_;
+
+    case CommandType::MAINT_KILL_OFF:
+      setKillRelay(false);
+      return true;
+
+    default:
+      return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +568,8 @@ void PumpController::rememberLastCommand(CommandType type, const char* requestId
 
 CommandResult PumpController::handleCommand(CommandType type,
                                             const char* requestId,
-                                            uint32_t now) {
+                                            uint32_t now,
+                                            const StartTimings* timings) {
   now_ = now;
 
   // Safety limits are re-evaluated before any command is acted on, so a
@@ -551,6 +623,12 @@ CommandResult PumpController::handleCommand(CommandType type,
         out.httpStatus = 409;
         break;
       }
+      // Latch the timings this run will use. clamp() is applied here as well
+      // as at the HTTP layer, so no caller can request a longer crank than
+      // the hard ceiling even if validation is ever bypassed.
+      timings_ = (timings != nullptr) ? *timings : StartTimings();
+      timings_.clamp();
+
       // 1. kill open, 2. starter inactive, 3. choke on, 4. CHOKING.
       setKillRelay(false);
       setStarterRelay(false);
@@ -603,6 +681,32 @@ CommandResult PumpController::handleCommand(CommandType type,
       } else {
         enterState(PumpState::IDLE);
       }
+      out.accepted = true;
+      out.httpStatus = 202;
+      break;
+    }
+
+    case CommandType::MAINT_CHOKE_ON:
+    case CommandType::MAINT_CHOKE_OFF:
+    case CommandType::MAINT_STARTER_ON:
+    case CommandType::MAINT_STARTER_OFF:
+    case CommandType::MAINT_KILL_ON:
+    case CommandType::MAINT_KILL_OFF: {
+      if (!maintenancePermitted()) {
+        out.accepted = false;
+        out.httpStatus = 409;
+        break;
+      }
+      if (!applyMaintenance(type)) {
+        // Refused by an interlock -- most commonly starter-on while the kill
+        // circuit is grounded.
+        out.accepted = false;
+        out.httpStatus = 409;
+        break;
+      }
+      // Deliberately no state change: manual relay work happens in place.
+      // startPermitted() already refuses while any relay is energised, so a
+      // START cannot be layered on top of a manually driven relay.
       out.accepted = true;
       out.httpStatus = 202;
       break;

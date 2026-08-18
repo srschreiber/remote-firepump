@@ -418,8 +418,10 @@ Request bodies are ignored — none of these endpoints take one.
 | `POST` | `/v1/start-failed` | Operator/camera confirms the previous start did not work      |
 | `POST` | `/v1/reset-idle`   | Operator confirms the engine is stopped after reboot/`UNKNOWN`|
 
-There are deliberately **no endpoints that toggle individual relays.** The Pi
-cannot bypass the interlocks.
+In the default build there are **no endpoints that toggle individual relays** —
+the Pi cannot bypass the interlocks. A bench-commissioning
+[maintenance API](#maintenance-api-disabled-by-default) exists behind a
+compile-time flag that is off by default.
 
 ### Authentication
 
@@ -461,6 +463,15 @@ curl \
     "rssi_dbm": -57
   },
   "cooldown_remaining_ms": 0,
+  "timings": {
+    "choke_prep_ms": 1000,
+    "crank_ms": 2000,
+    "unchoke_delay_ms": 500,
+    "kill_hold_ms": 3000,
+    "min_recrank_gap_ms": 10000,
+    "max_crank_ms": 5000
+  },
+  "maintenance_api": false,
   "last_command": {
     "type": "STOP",
     "request_id": "stop-123",
@@ -469,6 +480,11 @@ curl \
   "fault": null
 }
 ```
+
+`timings` reports what the current (or most recent) start sequence is actually
+using, including any per-request override — so a client can render an accurate
+progress bar instead of assuming the defaults. `max_crank_ms` is the hard
+ceiling and never moves.
 
 > `relay_outputs` are the Arduino's **commanded** output states. They do not
 > prove the physical relay moved, that the contact closed, or that the engine
@@ -520,6 +536,41 @@ wait for it to finish:
   "running_confirmed": false
 }
 ```
+
+#### Per-request timing overrides
+
+`POST /v1/start` accepts three optional headers. Omitted headers use the
+`config.h` defaults.
+
+| Header | Overrides | Maximum |
+| ------ | --------- | ------- |
+| `X-Choke-Ms` | `CHOKE_PREP_MS` | `MAX_CHOKE_PREP_OVERRIDE_MS` (15000) |
+| `X-Crank-Ms` | `CRANK_DURATION_MS` | **`MAX_CRANK_MS` (5000)** |
+| `X-Unchoke-Ms` | `UNCHOKE_DELAY_MS` | `MAX_UNCHOKE_DELAY_OVERRIDE_MS` (5000) |
+
+```bash
+# A longer crank for a cold engine
+curl -X POST \
+  -H "X-Pump-Secret: YOUR_SECRET" \
+  -H "X-Request-ID: start-cold-001" \
+  -H "X-Crank-Ms: 3500" \
+  http://192.168.1.50:8080/v1/start
+```
+
+Rules:
+
+* Values must be plain decimal milliseconds. Anything else → `400`
+  `invalid_timing_override`.
+* **Out-of-range values are rejected with `400`, not silently clamped**, so the
+  caller always knows exactly what ran.
+* `X-Crank-Ms` can only ever *lower* the crank time. The `MAX_CRANK_MS`
+  backstop in `enforceSafety()` is unchanged and still force-releases the
+  starter, so no request can extend starter engagement past the hard ceiling.
+  The controller re-clamps on the way in as well, so even a caller bypassing
+  the HTTP layer cannot exceed it.
+* These headers are only valid on `/v1/start`. Sending them anywhere else →
+  `400` `timing_override_not_applicable`.
+* Overrides apply to that one run only and never survive a reboot.
 
 Not permitted → `409`, with the current state and cooldown remaining:
 
@@ -577,13 +628,58 @@ Accepted from `RUNNING_ASSUMED` (the normal case), and also from `RETRY_WAIT`,
 `IDLE` and `UNKNOWN`, where it is a safe no-op that re-asserts "all relays
 off". Rejected with `409` during an active sequence or from `FAULT`.
 
+### Maintenance API (disabled by default)
+
+For bench commissioning, the firmware can expose direct relay control:
+
+```
+POST /v1/maintenance/choke/on      POST /v1/maintenance/choke/off
+POST /v1/maintenance/starter/on    POST /v1/maintenance/starter/off
+POST /v1/maintenance/kill/on       POST /v1/maintenance/kill/off
+```
+
+**These are compiled out by default.** Enable in `config.h`:
+
+```cpp
+#define ENABLE_MAINTENANCE_API 1
+```
+
+When disabled the routes are indistinguishable from any other unknown path —
+they return `404`, not `403`. `GET /v1/status` reports `"maintenance_api"` so a
+client can tell without probing.
+
+```bash
+curl -X POST \
+  -H "X-Pump-Secret: YOUR_SECRET" \
+  -H "X-Request-ID: maint-001" \
+  http://192.168.1.50:8080/v1/maintenance/choke/on
+```
+
+**Every hard interlock still applies**, even with the flag on:
+
+* The starter cannot be energised while the kill circuit is grounded → `409`
+  (a refusal, not a fault).
+* Grounding kill still releases the starter first, in that order.
+* A manually engaged starter is still force-released at `MAX_CRANK_MS`, and a
+  manually engaged choke at `MAX_CHOKE_MS`. Both raise the usual fault.
+* `STOP` still overrides everything, including manually held relays.
+* Manual commands are only accepted from `IDLE` or `UNKNOWN` — never
+  mid-sequence, never from `FAULT` → `409`.
+* `START` is refused while any relay is manually energised. (This tightening
+  applies unconditionally: `startPermitted()` now requires all relays at rest.
+  In normal operation `IDLE` always satisfies that, so nothing else changes.)
+
+> ⚠️ **Do not ship this enabled on a controller wired to a real engine.**
+> Direct relay control bypasses the sequencing that makes the normal API safe.
+> It is a screwdriver, not a feature.
+
 ### Error responses
 
 All errors return JSON.
 
 | Status | Meaning |
 | ------ | ------- |
-| `400` | Malformed request, or invalid `X-Request-ID` |
+| `400` | Malformed request, invalid `X-Request-ID`, or a bad/out-of-range timing override |
 | `401` | Missing or incorrect secret |
 | `404` | Unknown endpoint |
 | `405` | Wrong HTTP method for a known path |
@@ -885,14 +981,15 @@ powershell -ExecutionPolicy Bypass -File src\arduino\tests\run_tests.ps1
 Current status:
 
 ```
-tests: 123 passed, 0 failed | assertions: 8667826 run, 0 failed
-HOST TEST SUITE PASSED (both relay polarities)
+tests: 151 passed, 0 failed | assertions: 8668034 run, 0 failed
+HOST TEST SUITE PASSED (both polarities x maintenance on/off)
 ```
 
-The whole suite is built and run **twice — once at each relay polarity** — so
-`RELAY_ACTIVE_LOW` is proven to be the single point of control rather than
-assumed to be. Warnings are errors (`-Wall -Wextra -Wshadow -Wconversion
--Wsign-conversion -Wold-style-cast -Werror`).
+The suite is built and run across a **four-way configuration matrix** — both
+relay polarities × maintenance API on/off — so `RELAY_ACTIVE_LOW` is proven to
+be the single point of control, and `ENABLE_MAINTENANCE_API` is proven to
+control endpoint reachability in both directions. Warnings are errors (`-Wall
+-Wextra -Wshadow -Wconversion -Wsign-conversion -Wold-style-cast -Werror`).
 
 A fake Arduino layer (`tests/shim/`) records every `pinMode` and
 `digitalWrite` with a timestamp and sequence number, so tests assert on the
@@ -976,13 +1073,15 @@ cd docs/examples && python3 test_examples.py
 ```
 
 ```
-passed 63 | failed 0
+passed 88 | failed 0
 ```
 
 This covers the boundary the Pi will actually depend on: `START` gating, the
 full sequence, `STOP` from every state, the duplicate-suppression rules
 (including the `STOP` exemption), `401` before routing, request-ID validation,
-unreachable-device handling and the background poller.
+timing overrides and their rejection cases, the maintenance API in both the
+enabled and disabled builds, unreachable-device handling and the background
+poller.
 
 ---
 

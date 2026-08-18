@@ -42,6 +42,11 @@ servers:
 tags:
   - name: status
   - name: commands
+  - name: maintenance
+    description: |
+      Bench-commissioning only. Compiled out of the default firmware; the
+      paths return 404 unless `ENABLE_MAINTENANCE_API=1` was set at build
+      time. Check `maintenance_api` in `/v1/status`.
 
 paths:
   /v1/status:
@@ -81,10 +86,18 @@ paths:
         5. After `UNCHOKE_DELAY_MS` (500 ms) release choke → `RUNNING_ASSUMED`
 
         There is **no automatic retry** if the engine fails to start.
+        Accepts optional per-request timing overrides; see the
+        `ChokeMs`/`CrankMs`/`UnchokeMs` headers. Out-of-range values are
+        rejected with `400` rather than silently clamped, and `X-Crank-Ms` can
+        only ever *lower* the crank time — `MAX_CRANK_MS` remains enforced at
+        the relay layer.
       operationId: startPump
       parameters:
         - $ref: '#/components/parameters/PumpSecret'
         - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ChokeMs'
+        - $ref: '#/components/parameters/CrankMs'
+        - $ref: '#/components/parameters/UnchokeMs'
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -182,9 +195,119 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
 
+  /v1/maintenance/{relay}/{action}:
+    post:
+      tags: [maintenance]
+      summary: Drive one relay directly (bench commissioning only)
+      description: |
+        **Compiled out by default.** Only present when the firmware was built
+        with `ENABLE_MAINTENANCE_API=1`. Otherwise these paths behave exactly
+        like any other unknown route and return `404` — not `403`. Read
+        `maintenance_api` from `/v1/status` instead of probing.
+
+        Intended for bench commissioning with the engine's 12 V contact-side
+        wiring disconnected. It bypasses the start/stop sequencing that makes
+        the normal API safe, so **do not build an operator UI around it and do
+        not ship it enabled on a controller wired to a real engine.**
+
+        Every hard interlock still applies:
+
+        * Energising the starter while the kill circuit is grounded is refused
+          with `409` (a refusal, not a fault).
+        * Grounding kill releases the starter first, in that order.
+        * A manually engaged starter is still force-released at
+          `MAX_CRANK_MS`, and a manually engaged choke at `MAX_CHOKE_MS`;
+          both raise the usual fault.
+        * `STOP` still overrides everything, including manually held relays.
+        * Accepted only from `IDLE` or `UNKNOWN` — never mid-sequence, never
+          from `FAULT` (`409`).
+        * `START` is refused while any relay is manually energised.
+      operationId: maintenanceRelay
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+        - $ref: '#/components/parameters/RequestId'
+        - name: relay
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [choke, starter, kill]
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [on, off]
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            The firmware was built without `ENABLE_MAINTENANCE_API`. This is
+            the normal, shipped configuration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409':
+          description: |
+            Refused by an interlock — most commonly starter-on while the kill
+            circuit is grounded, or a manual command outside `IDLE`/`UNKNOWN`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
 components:
 
   parameters:
+    ChokeMs:
+      name: X-Choke-Ms
+      in: header
+      required: false
+      description: |
+        Overrides `CHOKE_PREP_MS` for this start only. Plain decimal
+        milliseconds. Above the maximum → `400 choke_ms_out_of_range`.
+        Valid only on `POST /v1/start`.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 15000
+      example: 500
+
+    CrankMs:
+      name: X-Crank-Ms
+      in: header
+      required: false
+      description: |
+        Overrides `CRANK_DURATION_MS` for this start only. Plain decimal
+        milliseconds.
+
+        **Can only lower the crank time.** Above `max_crank_ms` → `400
+        crank_ms_out_of_range`; the value is never silently clamped, and the
+        relay-layer backstop enforces the ceiling independently regardless.
+        Valid only on `POST /v1/start`.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 5000
+      example: 3500
+
+    UnchokeMs:
+      name: X-Unchoke-Ms
+      in: header
+      required: false
+      description: |
+        Overrides `UNCHOKE_DELAY_MS` for this start only. Plain decimal
+        milliseconds. Above the maximum → `400 unchoke_ms_out_of_range`.
+        Valid only on `POST /v1/start`.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 5000
+      example: 250
+
     PumpSecret:
       name: X-Pump-Secret
       in: header
@@ -359,12 +482,43 @@ components:
         request_id: { type: string }
         accepted:   { type: boolean }
 
+    Timings:
+      type: object
+      description: |
+        Timings the current (or most recent) start sequence is using,
+        **including any per-request override**. Drive progress indicators from
+        this rather than from hardcoded constants.
+      required: [choke_prep_ms, crank_ms, unchoke_delay_ms, kill_hold_ms,
+                 min_recrank_gap_ms, max_crank_ms]
+      properties:
+        choke_prep_ms:
+          type: integer
+          description: Choke engaged before the starter is engaged.
+        crank_ms:
+          type: integer
+          description: Starter engagement for the current run.
+        unchoke_delay_ms:
+          type: integer
+          description: Starter release to choke release.
+        kill_hold_ms:
+          type: integer
+          description: How long STOP holds the kill circuit grounded.
+        min_recrank_gap_ms:
+          type: integer
+          description: Minimum interval between starter engagements.
+        max_crank_ms:
+          type: integer
+          description: |
+            Absolute starter ceiling, enforced at the relay layer independently
+            of the state machine. **Never moves**, and no override can raise
+            `crank_ms` above it.
+
     Status:
       type: object
       required:
         [device, firmware_version, state, state_elapsed_ms, uptime_ms,
          engine_status, running_confirmed, relay_outputs, wifi,
-         cooldown_remaining_ms, last_command, fault]
+         cooldown_remaining_ms, timings, maintenance_api, last_command, fault]
       properties:
         device:
           type: string
@@ -403,6 +557,13 @@ components:
           description: |
             Remaining recrank cooldown, measured from the last starter
             release. `START` is refused with `409` while this is above zero.
+        timings:
+          $ref: '#/components/schemas/Timings'
+        maintenance_api:
+          type: boolean
+          description: |
+            Whether this firmware was built with the `/v1/maintenance/*`
+            endpoints. Normally `false`. Check this instead of probing.
         last_command:
           $ref: '#/components/schemas/LastCommand'
         fault:
@@ -459,6 +620,11 @@ components:
             - malformed_request_target
             - malformed_header
             - incomplete_request
+            - invalid_timing_override
+            - timing_override_not_applicable
+            - choke_ms_out_of_range
+            - crank_ms_out_of_range
+            - unchoke_ms_out_of_range
         message:
           type: string
           description: Human-readable explanation. Never contains a secret.

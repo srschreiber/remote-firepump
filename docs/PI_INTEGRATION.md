@@ -105,8 +105,56 @@ There is no keep-alive, no websocket, no server-sent events. Poll
 
 No request bodies. Any body sent is ignored.
 
-There is deliberately **no endpoint to toggle an individual relay.** If you
-find yourself wanting one, the answer is no.
+In the default build there is **no endpoint to toggle an individual relay.**
+See §3.1 for the flag-gated bench-commissioning API, which is off by default
+and which you should not build an operator UI around.
+
+### 3.1 Optional extras
+
+**Per-request timing overrides** — `POST /v1/start` accepts three optional
+headers. Omit any of them to use the device default.
+
+| Header | Overrides | Maximum |
+|---|---|---|
+| `X-Choke-Ms` | choke prep | 15000 |
+| `X-Crank-Ms` | starter engagement | **5000** (`max_crank_ms`, the hard ceiling) |
+| `X-Unchoke-Ms` | starter-release → choke-off | 5000 |
+
+```python
+pump.start(crank_ms=3500)              # longer crank for a cold engine
+```
+
+Rules that matter to your client:
+
+* Values are plain decimal milliseconds. Anything else → `400`
+  `invalid_timing_override`.
+* **Out of range is a `400`, not a silent clamp.** Read `max_crank_ms` from
+  `/v1/status` and validate before sending, so you can show a useful message
+  instead of surfacing a raw error.
+* An override can only ever *lower* the crank time. The device's
+  `MAX_CRANK_MS` backstop is unchanged, so nothing you send can extend starter
+  engagement past the ceiling.
+* Only valid on `/v1/start`. Anywhere else → `400`
+  `timing_override_not_applicable`.
+* Applies to that one run only; never persisted, never survives a reboot.
+
+If you expose this in a UI, treat it as an advanced control — a plain `START`
+with the configured defaults should be the obvious path.
+
+**Maintenance API** — `POST /v1/maintenance/{choke,starter,kill}/{on,off}`,
+compiled out unless the firmware was built with `ENABLE_MAINTENANCE_API=1`.
+When disabled the paths return `404`, exactly like any unknown route; check
+`maintenance_api` in `/v1/status` rather than probing.
+
+Every interlock still applies: the starter is refused while kill is grounded
+(`409`), grounding kill releases the starter first, the `MAX_CRANK_MS` and
+choke backstops still fire, `STOP` still overrides everything, and manual
+commands are only accepted from `IDLE`/`UNKNOWN`. `START` is refused while any
+relay is manually energised.
+
+**Do not build the operator UI around this.** It is for bench commissioning
+with the 12 V side disconnected. If you surface it at all, put it behind a
+"maintenance" screen that is hidden unless `maintenance_api` is `true`.
 
 ### `GET /v1/status`
 
@@ -124,6 +172,11 @@ find yourself wanting one, the answer is no.
   },
   "wifi": { "connected": true, "ip": "192.168.1.50", "rssi_dbm": -57 },
   "cooldown_remaining_ms": 0,
+  "timings": {
+    "choke_prep_ms": 1000, "crank_ms": 2000, "unchoke_delay_ms": 500,
+    "kill_hold_ms": 3000, "min_recrank_gap_ms": 10000, "max_crank_ms": 5000
+  },
+  "maintenance_api": false,
   "last_command": { "type": "STOP", "request_id": "stop-123", "accepted": true },
   "fault": null
 }
@@ -138,6 +191,8 @@ find yourself wanting one, the answer is no.
 | `running_confirmed` | bool | **Always `false`.** See §6. |
 | `relay_outputs` | object | **Commanded** output states, not proof of anything |
 | `cooldown_remaining_ms` | uint32 | Recrank cooldown; `START` is refused while > 0 |
+| `timings` | object | Timings the current/most recent start sequence is using, **including any override**. Drive your progress UI from this, not from hardcoded constants. `max_crank_ms` is the hard ceiling and never moves. |
+| `maintenance_api` | bool | Whether the device was built with the maintenance endpoints. Normally `false`. |
 | `last_command` | object\|null | `null` until the first command since boot |
 | `fault` | string\|null | `null` when healthy; see §7 |
 
@@ -174,7 +229,7 @@ All errors are JSON:
 
 | Status | `error` values | What the Pi should do |
 |---|---|---|
-| `400` | `invalid_request_id`, `malformed_request_line`, `malformed_header`, `incomplete_request` | **Bug in your client.** Log loudly, do not retry. |
+| `400` | `invalid_request_id`, `malformed_request_line`, `malformed_header`, `incomplete_request`, `invalid_timing_override`, `crank_ms_out_of_range`, `choke_ms_out_of_range`, `unchoke_ms_out_of_range`, `timing_override_not_applicable` | **Bug in your client.** Log loudly, do not retry. |
 | `401` | `unauthorized` | Misconfigured secret. Do not retry. Alert the operator. |
 | `404` | `not_found` | Wrong path. Bug in your client. |
 | `405` | `method_not_allowed` | Wrong verb. Bug in your client. |
@@ -215,17 +270,20 @@ UNKNOWN ──reset-idle──▶ IDLE ──start──▶ CHOKING ──▶ CR
 | `RETRY_WAIT` | Cooling down after a failed start | "Waiting before another attempt: Ns" | No |
 | `FAULT` | Safety invariant tripped | "FAULT: `<fault>`" prominently + recovery action | No |
 
-Approximate timings (authoritative values are in the firmware's `config.h`):
+Default timings — but **read them from `/v1/status`'s `timings` object rather
+than hardcoding**, since they are configurable at build time and overridable
+per request:
 
-| Constant | Default |
+| Field | Default |
 |---|---|
-| `CHOKE_PREP_MS` | 1000 |
-| `CRANK_DURATION_MS` | 2000 |
-| `UNCHOKE_DELAY_MS` | 500 |
-| `KILL_HOLD_MS` | 3000 |
-| `MIN_RECRANK_GAP_MS` | 10000 |
+| `choke_prep_ms` | 1000 |
+| `crank_ms` | 2000 |
+| `unchoke_delay_ms` | 500 |
+| `kill_hold_ms` | 3000 |
+| `min_recrank_gap_ms` | 10000 |
+| `max_crank_ms` | 5000 (hard ceiling, never moves) |
 
-So a full start takes about **3.5 s** from `202` to `RUNNING_ASSUMED`, and a
+So a default start takes about **3.5 s** from `202` to `RUNNING_ASSUMED`, and a
 stop takes about **3 s** to return to `IDLE`.
 
 ---
@@ -436,6 +494,11 @@ the highest-fidelity option and what you should test against before release.
 - `202` on a replayed `STOP` that **still executes**
 - `401` for a wrong secret, including on unknown paths
 - `running_confirmed` always `false`
+- `400` (not a clamp) for `X-Crank-Ms` above `max_crank_ms`
+- `404` on `/v1/maintenance/*` unless the maintenance build is in use
+
+The supplied stub already does all of this; run it with `--maintenance` to
+model a maintenance-enabled device.
 
 **Option C — run the firmware's own host tests.** The state machine compiles
 and runs natively; see `src/arduino/tests/`. If you want to check your

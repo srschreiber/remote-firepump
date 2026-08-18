@@ -305,12 +305,133 @@ def main() -> int:
         poller.stop_polling()
         check("poller stops cleanly", not poller.is_alive())
 
+        # -- timing overrides -------------------------------------------------
+        print("\n[timing overrides]")
+        st = pump.status()
+        check("status reports the timings in use",
+              st.timings.crank_ms == 2000 and st.timings.choke_prep_ms == 1000,
+              str(st.timings))
+        check("status reports the hard crank ceiling",
+              st.timings.max_crank_ms == 5000)
+        check("total_start_ms is computed", st.timings.total_start_ms == 3500,
+              str(st.timings.total_start_ms))
+
+        settle_to_idle(pump)
+        pump.start(crank_ms=1000, choke_ms=300, unchoke_ms=200)
+        st = pump.status()
+        check("override is reflected in status",
+              st.timings.crank_ms == 1000 and st.timings.choke_prep_ms == 300,
+              str(st.timings))
+        check("the hard ceiling does not move with an override",
+              st.timings.max_crank_ms == 5000)
+
+        t0 = time.monotonic()
+        while pump.status().state != "RUNNING_ASSUMED" and time.monotonic() - t0 < 5:
+            time.sleep(0.02)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        check("the shortened sequence really was shorter", elapsed_ms < 2500,
+              f"{elapsed_ms:.0f} ms for a 1500 ms sequence")
+
+        settle_to_idle(pump)
+        try:
+            pump.start(crank_ms=99999)
+            check("an over-ceiling crank override is rejected", False)
+        except PumpClientBug as exc:
+            check("an over-ceiling crank override is rejected", True, str(exc)[:60])
+        check("the rejected override did not start the pump",
+              pump.status().state == "IDLE")
+
+        try:
+            pump.start(crank_ms=-5)
+            check("a negative override is rejected client-side", False)
+        except ValueError:
+            check("a negative override is rejected client-side", True)
+
+        # Timing headers are only meaningful on START.
+        try:
+            pump._command("/v1/stop", "stop", None, {"X-Crank-Ms": "1000"})
+            check("timing headers on /v1/stop are rejected", False)
+        except PumpClientBug:
+            check("timing headers on /v1/stop are rejected", True)
+
+        # -- maintenance API is absent by default -----------------------------
+        print("\n[maintenance API disabled by default]")
+        check("status advertises maintenance_api=false",
+              pump.status().maintenance_api is False)
+        try:
+            pump.maintenance("choke", True)
+            check("maintenance endpoints 404 when disabled", False)
+        except PumpClientBug:
+            check("maintenance endpoints 404 when disabled", True)
+        try:
+            pump.maintenance("nonsense", True)
+            check("an unknown relay name is rejected client-side", False)
+        except ValueError:
+            check("an unknown relay name is rejected client-side", True)
+
         # -- leave it safe ----------------------------------------------------
         settle_to_idle(pump)
         check("final state is IDLE", pump.status().state == "IDLE")
 
     finally:
         shutdown()
+
+    # -- maintenance API enabled (separate instance) --------------------------
+    print("\n[maintenance API enabled]")
+    port2 = free_port()
+    _h2, _m2, shutdown2 = serve(port2, SECRET, maintenance=True)
+    time.sleep(0.2)
+    maint = PumpClient("127.0.0.1", SECRET, port=port2, timeout=2.0)
+    try:
+        check("status advertises maintenance_api=true",
+              maint.status().maintenance_api is True)
+        maint.reset_idle()
+
+        r = maint.maintenance("choke", True)
+        check("manual choke on accepted", r.accepted)
+        check("choke relay is energised", maint.status().relay_outputs.choke)
+
+        # START must be refused while a relay is manually held.
+        try:
+            maint.start()
+            check("START refused while a relay is manually energised", False)
+        except PumpConflict:
+            check("START refused while a relay is manually energised", True)
+
+        maint.maintenance("choke", False)
+        check("choke relay released", not maint.status().relay_outputs.choke)
+
+        # Interlock: starter cannot join a grounded kill.
+        maint.maintenance("kill", True)
+        check("kill relay is grounded", maint.status().relay_outputs.kill)
+        try:
+            maint.maintenance("starter", True)
+            check("starter refused while kill is grounded", False)
+        except PumpConflict:
+            check("starter refused while kill is grounded", True)
+        check("starter stayed open", not maint.status().relay_outputs.starter)
+        maint.maintenance("kill", False)
+
+        # Grounding kill releases a manually held starter.
+        maint.maintenance("starter", True)
+        check("manual starter engaged", maint.status().relay_outputs.starter)
+        maint.maintenance("kill", True)
+        s = maint.status()
+        check("kill-on released the starter first",
+              s.relay_outputs.kill and not s.relay_outputs.starter,
+              str(s.relay_outputs))
+        maint.maintenance("kill", False)
+
+        # STOP still overrides everything.
+        maint.maintenance("choke", True)
+        maint.stop()
+        s = maint.status()
+        check("STOP clears manually held relays",
+              not s.relay_outputs.choke and not s.relay_outputs.starter,
+              str(s.relay_outputs))
+        check("STOP grounded the kill circuit", s.relay_outputs.kill)
+    finally:
+        shutdown2()
 
     print("\n" + "=" * 60)
     print(f"passed {_passed} | failed {_failed}")

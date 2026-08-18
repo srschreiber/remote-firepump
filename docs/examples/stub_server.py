@@ -43,11 +43,20 @@ CRANK_DURATION_MS = 2000
 UNCHOKE_DELAY_MS = 500
 KILL_HOLD_MS = 3000
 MIN_RECRANK_GAP_MS = 10000
+MAX_CRANK_MS = 5000
+
+MAX_CHOKE_PREP_OVERRIDE_MS = 15000
+MAX_UNCHOKE_DELAY_OVERRIDE_MS = 5000
 
 FIRMWARE_VERSION = "0.1.0"
 DEVICE_NAME = "fire-pump-controller"
 IDEMPOTENCY_SLOTS = 8
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+UINT32_RE = re.compile(r"^[0-9]{1,10}$")
+
+# Mirrors the firmware's ENABLE_MAINTENANCE_API. Off by default, matching the
+# shipped default; --maintenance turns it on.
+MAINTENANCE_ENABLED = False
 
 # Request-line / header limits, so 413 can be exercised too.
 MAX_REQUEST_LINE = 256
@@ -72,6 +81,9 @@ class PumpModel:
         self.last_starter_release_at = None
         self.last_command = None
         self._ring: list[tuple[str, str, int, bool]] = []   # id, cmd, status, accepted
+        self.timings = {"choke_prep_ms": CHOKE_PREP_MS,
+                        "crank_ms": CRANK_DURATION_MS,
+                        "unchoke_delay_ms": UNCHOKE_DELAY_MS}
 
     # -- helpers -----------------------------------------------------------
 
@@ -100,16 +112,16 @@ class PumpModel:
         with self._lock:
             elapsed = now_ms() - self.state_entered_at
 
-            if self.state == "CHOKING" and elapsed >= CHOKE_PREP_MS:
+            if self.state == "CHOKING" and elapsed >= self.timings["choke_prep_ms"]:
                 self.relays["kill"] = False
                 self.relays["starter"] = True
                 self._enter("CRANKING")
 
-            elif self.state == "CRANKING" and elapsed >= CRANK_DURATION_MS:
+            elif self.state == "CRANKING" and elapsed >= self.timings["crank_ms"]:
                 self._release_starter()
                 self._enter("UNCHOKING")
 
-            elif self.state == "UNCHOKING" and elapsed >= UNCHOKE_DELAY_MS:
+            elif self.state == "UNCHOKING" and elapsed >= self.timings["unchoke_delay_ms"]:
                 self.relays["choke"] = False
                 self._enter("RUNNING_ASSUMED")
 
@@ -143,11 +155,20 @@ class PumpModel:
                 "relay_outputs": dict(self.relays),
                 "wifi": {"connected": True, "ip": "127.0.0.1", "rssi_dbm": -42},
                 "cooldown_remaining_ms": self._cooldown_remaining(),
+                "timings": {
+                    **self.timings,
+                    "kill_hold_ms": KILL_HOLD_MS,
+                    "min_recrank_gap_ms": MIN_RECRANK_GAP_MS,
+                    # The hard ceiling never moves with an override.
+                    "max_crank_ms": MAX_CRANK_MS,
+                },
+                "maintenance_api": MAINTENANCE_ENABLED,
                 "last_command": self.last_command,
                 "fault": self.fault,
             }
 
-    def command(self, cmd: str, request_id: str) -> tuple[int, dict]:
+    def command(self, cmd: str, request_id: str,
+                timings: dict | None = None) -> tuple[int, dict]:
         with self._lock:
             prior = next((r for r in self._ring
                           if r[0] == request_id and r[1] == cmd), None) \
@@ -166,7 +187,7 @@ class PumpModel:
                     "running_confirmed": False,
                 }
 
-            accepted, status = self._apply(cmd)
+            accepted, status = self._apply(cmd, timings)
 
             self.last_command = {"type": cmd, "request_id": request_id or "",
                                  "accepted": accepted}
@@ -195,7 +216,24 @@ class PumpModel:
                 "running_confirmed": False,
             }
 
-    def _apply(self, cmd: str) -> tuple[bool, int]:
+    def _apply(self, cmd: str, timings: dict | None = None) -> tuple[bool, int]:
+        if cmd.startswith("MAINT_"):
+            # Only from a settled state; never mid-sequence, never from FAULT.
+            if self.state not in ("IDLE", "UNKNOWN"):
+                return False, 409
+            _, relay, action = cmd.split("_", 2)
+            relay = relay.lower()
+            on = (action == "ON")
+            if relay == "starter" and on and self.relays["kill"]:
+                return False, 409           # interlock, not a fault
+            if relay == "kill" and on:
+                self._release_starter()     # starter opens first, in order
+            if relay == "starter" and not on:
+                self._release_starter()
+            else:
+                self.relays[relay] = on
+            return True, 202
+
         if cmd == "STOP":
             # Accepted from every state, without exception.
             self._release_starter()
@@ -207,8 +245,16 @@ class PumpModel:
             return True, 202
 
         if cmd == "START":
-            if self.state != "IDLE" or self._cooldown_remaining() > 0:
+            # Every relay must already be at rest, so a START can never be
+            # layered on top of a manually driven maintenance relay.
+            if (self.state != "IDLE" or self._cooldown_remaining() > 0
+                    or any(self.relays.values())):
                 return False, 409
+            self.timings = {"choke_prep_ms": CHOKE_PREP_MS,
+                            "crank_ms": CRANK_DURATION_MS,
+                            "unchoke_delay_ms": UNCHOKE_DELAY_MS}
+            if timings:
+                self.timings.update(timings)
             self.relays["kill"] = False
             self.relays["starter"] = False
             self.relays["choke"] = True
@@ -245,7 +291,27 @@ ROUTES = {
     ("POST", "/v1/start-failed"): "START_FAILED",
     ("POST", "/v1/reset-idle"): "RESET_IDLE",
 }
-KNOWN_PATHS = {p for _m, p in ROUTES}
+MAINT_ROUTES = {
+    ("POST", f"/v1/maintenance/{relay}/{action}"):
+        f"MAINT_{relay.upper()}_{action.upper()}"
+    for relay in ("choke", "starter", "kill")
+    for action in ("on", "off")
+}
+
+# Headers carrying per-request start-sequence overrides.
+TIMING_HEADERS = {
+    "X-Choke-Ms": ("choke_prep_ms", MAX_CHOKE_PREP_OVERRIDE_MS, "choke_ms_out_of_range"),
+    "X-Crank-Ms": ("crank_ms", MAX_CRANK_MS, "crank_ms_out_of_range"),
+    "X-Unchoke-Ms": ("unchoke_delay_ms", MAX_UNCHOKE_DELAY_OVERRIDE_MS,
+                     "unchoke_ms_out_of_range"),
+}
+
+
+def active_routes() -> dict:
+    routes = dict(ROUTES)
+    if MAINTENANCE_ENABLED:
+        routes.update(MAINT_ROUTES)
+    return routes
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -296,17 +362,20 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
         state = self.model.status()["state"]
 
-        if path not in KNOWN_PATHS:
+        routes = active_routes()
+        known_paths = {p for _m, p in routes}
+
+        if path not in known_paths:
             self._error(404, "not_found", "unknown endpoint", state)
             return
 
         key = (method, path)
-        if key not in ROUTES:
+        if key not in routes:
             self._error(405, "method_not_allowed",
                         "method not allowed for this path", state)
             return
 
-        cmd = ROUTES[key]
+        cmd = routes[key]
         if cmd is None:
             self._send(200, self.model.status())
             return
@@ -318,7 +387,33 @@ class Handler(BaseHTTPRequestHandler):
                         state)
             return
 
-        status, body = self.model.command(cmd, rid or "")
+        # Optional per-request timing overrides. Out-of-range values are
+        # rejected rather than clamped, so the caller knows what actually ran.
+        timings = {}
+        supplied = {h: self.headers.get(h) for h in TIMING_HEADERS
+                    if self.headers.get(h) is not None}
+        if supplied:
+            if cmd != "START":
+                self._error(400, "timing_override_not_applicable",
+                            "timing override headers are only valid on "
+                            "POST /v1/start", state)
+                return
+            for header, raw in supplied.items():
+                key_name, ceiling, code = TIMING_HEADERS[header]
+                if not UINT32_RE.match(raw.strip()):
+                    self._error(400, "invalid_timing_override",
+                                "timing headers must be plain decimal "
+                                "milliseconds", state)
+                    return
+                value = int(raw)
+                if value > ceiling:
+                    self._error(400, code,
+                                f"{header} exceeds the configured maximum",
+                                state)
+                    return
+                timings[key_name] = value
+
+        status, body = self.model.command(cmd, rid or "", timings or None)
         self._send(status, body)
 
     def do_GET(self):
@@ -334,8 +429,12 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
 
-def serve(port: int, secret: str, host: str = "127.0.0.1"):
+def serve(port: int, secret: str, host: str = "127.0.0.1",
+          maintenance: bool = False):
     """Starts the stub. Returns (httpd, model, shutdown_callable)."""
+    global MAINTENANCE_ENABLED
+    MAINTENANCE_ENABLED = maintenance
+
     model = PumpModel()
 
     handler = type("BoundHandler", (Handler,), {"model": model, "secret": secret})
@@ -367,15 +466,20 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--secret", default="dev-secret")
+    ap.add_argument("--maintenance", action="store_true",
+                    help="expose /v1/maintenance/* (mirrors building the "
+                         "firmware with ENABLE_MAINTENANCE_API=1)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    _httpd, _model, shutdown = serve(args.port, args.secret, args.host)
+    _httpd, _model, shutdown = serve(args.port, args.secret, args.host,
+                                     maintenance=args.maintenance)
     print(f"fire-pump stub listening on http://{args.host}:{args.port}")
     print(f"secret: {args.secret}")
+    print(f"maintenance API: {'ENABLED' if args.maintenance else 'disabled'}")
     print("initial state: UNKNOWN (send POST /v1/reset-idle to reach IDLE)")
     print("Ctrl-C to stop")
     try:

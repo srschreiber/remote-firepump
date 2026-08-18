@@ -214,6 +214,31 @@ void RequestParser::handleHeaderLine() {
     return;
   }
 
+  // Optional start-sequence timing overrides.
+  struct TimingHeader {
+    const char* name;
+    bool ParsedRequest::*present;
+    uint32_t ParsedRequest::*value;
+  };
+  static const TimingHeader kTimingHeaders[] = {
+      {"x-choke-ms",   &ParsedRequest::chokeMsPresent,   &ParsedRequest::chokeMs},
+      {"x-crank-ms",   &ParsedRequest::crankMsPresent,   &ParsedRequest::crankMs},
+      {"x-unchoke-ms", &ParsedRequest::unchokeMsPresent, &ParsedRequest::unchokeMs},
+  };
+  for (const TimingHeader& h : kTimingHeaders) {
+    if (!headerNameIs(line_, nameLen, h.name)) {
+      continue;
+    }
+    req_.*(h.present) = true;
+    uint32_t parsed = 0;
+    if (parseUint32(value, valueLen, parsed)) {
+      req_.*(h.value) = parsed;
+    } else {
+      req_.timingMalformed = true;
+    }
+    return;
+  }
+
   if (headerNameIs(line_, nameLen, "x-request-id")) {
     req_.requestIdPresent = true;
     if (valueLen == 0 || valueLen > REQUEST_ID_MAX_LEN) {
@@ -254,6 +279,17 @@ Route resolveRoute(HttpMethod method, const char* path) {
       {"/v1/stop",         HttpMethod::POST, RouteAction::COMMAND, CommandType::STOP},
       {"/v1/start-failed", HttpMethod::POST, RouteAction::COMMAND, CommandType::START_FAILED},
       {"/v1/reset-idle",   HttpMethod::POST, RouteAction::COMMAND, CommandType::RESET_IDLE},
+
+      // Maintenance endpoints. Present in the table unconditionally so the
+      // logic is always compiled and always unit-tested, but skipped below
+      // unless ENABLE_MAINTENANCE_API is set -- in which case they behave
+      // exactly like any other unknown path and return 404.
+      {"/v1/maintenance/choke/on",    HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_CHOKE_ON},
+      {"/v1/maintenance/choke/off",   HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_CHOKE_OFF},
+      {"/v1/maintenance/starter/on",  HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_STARTER_ON},
+      {"/v1/maintenance/starter/off", HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_STARTER_OFF},
+      {"/v1/maintenance/kill/on",     HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_KILL_ON},
+      {"/v1/maintenance/kill/off",    HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_KILL_OFF},
   };
 
   Route r;
@@ -262,6 +298,9 @@ Route resolveRoute(HttpMethod method, const char* path) {
   for (const Entry& e : table) {
     if (strcmp(path, e.path) != 0) {
       continue;
+    }
+    if (isMaintenanceCommand(e.command) && !MAINTENANCE_API_ENABLED) {
+      continue;   // invisible: falls through to 404
     }
     pathKnown = true;
     if (method == e.method) {
@@ -288,6 +327,27 @@ Route resolveRoute(HttpMethod method, const char* path) {
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+bool parseUint32(const char* s, size_t len, uint32_t& out) {
+  if (s == nullptr || len == 0 || len > 10) {
+    return false;   // 4294967295 is ten digits
+  }
+  uint32_t acc = 0;
+  for (size_t i = 0; i < len; ++i) {
+    const char c = s[i];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    const uint32_t digit = static_cast<uint32_t>(c - '0');
+    // Overflow check before it can happen.
+    if (acc > (0xFFFFFFFFu - digit) / 10u) {
+      return false;
+    }
+    acc = acc * 10u + digit;
+  }
+  out = acc;
+  return true;
+}
 
 bool isValidRequestId(const char* id) {
   if (id == nullptr) {
@@ -417,6 +477,10 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"spare\":%s},"
       "\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi_dbm\":%ld},"
       "\"cooldown_remaining_ms\":%lu,"
+      "\"timings\":{\"choke_prep_ms\":%lu,\"crank_ms\":%lu,"
+      "\"unchoke_delay_ms\":%lu,\"kill_hold_ms\":%lu,"
+      "\"min_recrank_gap_ms\":%lu,\"max_crank_ms\":%lu},"
+      "\"maintenance_api\":%s,"
       "\"last_command\":%s,"
       "\"fault\":%s"
       "}",
@@ -427,6 +491,13 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.spare),
       jsonBool(v.wifiConnected), v.ip, static_cast<long>(v.rssiDbm),
       static_cast<unsigned long>(v.cooldownRemainingMs),
+      static_cast<unsigned long>(v.chokePrepMs),
+      static_cast<unsigned long>(v.crankMs),
+      static_cast<unsigned long>(v.unchokeDelayMs),
+      static_cast<unsigned long>(KILL_HOLD_MS),
+      static_cast<unsigned long>(MIN_RECRANK_GAP_MS),
+      static_cast<unsigned long>(MAX_CRANK_MS),
+      jsonBool(MAINTENANCE_API_ENABLED),
       lastCommand, faultField);
 
   return finish(buf, cap, written);

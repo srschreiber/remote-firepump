@@ -128,6 +128,31 @@ class LastCommand:
 
 
 @dataclass(frozen=True)
+class Timings:
+    """Timings the current (or most recent) start sequence is using.
+
+    choke_prep_ms / crank_ms / unchoke_delay_ms reflect any per-request
+    override that was applied. max_crank_ms is the hard ceiling and never
+    moves -- an override can lower the crank time but never raise it past
+    this, and the firmware enforces that at the relay layer regardless.
+
+    Use these to render an accurate progress indicator rather than assuming
+    the config.h defaults.
+    """
+    choke_prep_ms: int = 1000
+    crank_ms: int = 2000
+    unchoke_delay_ms: int = 500
+    kill_hold_ms: int = 3000
+    min_recrank_gap_ms: int = 10000
+    max_crank_ms: int = 5000
+
+    @property
+    def total_start_ms(self) -> int:
+        """How long a full start sequence will take, end to end."""
+        return self.choke_prep_ms + self.crank_ms + self.unchoke_delay_ms
+
+
+@dataclass(frozen=True)
 class PumpStatus:
     device: str
     firmware_version: str
@@ -141,6 +166,8 @@ class PumpStatus:
     cooldown_remaining_ms: int
     last_command: Optional[LastCommand]
     fault: Optional[str]
+    timings: Timings = field(default_factory=Timings)
+    maintenance_api: bool = False
     raw: dict = field(repr=False, default_factory=dict)
 
     # -- convenience predicates for the UI ---------------------------------
@@ -222,6 +249,10 @@ class PumpStatus:
                 accepted=bool(last.get("accepted", False)),
             ) if isinstance(last, dict) else None),
             fault=body.get("fault"),
+            timings=Timings(**{k: int(v) for k, v in
+                               (body.get("timings") or {}).items()
+                               if k in Timings.__dataclass_fields__}),
+            maintenance_api=bool(body.get("maintenance_api", False)),
             raw=body,
         )
 
@@ -276,11 +307,13 @@ class PumpClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _once(self, method: str, path: str,
-              request_id: Optional[str]) -> tuple[int, Any, str]:
+    def _once(self, method: str, path: str, request_id: Optional[str],
+              extra: Optional[dict] = None) -> tuple[int, Any, str]:
         headers = {"X-Pump-Secret": self._secret, "Accept": "application/json"}
         if request_id is not None:
             headers["X-Request-ID"] = request_id
+        if extra:
+            headers.update(extra)
 
         conn = http.client.HTTPConnection(self.host, self.port,
                                           timeout=self.timeout)
@@ -297,14 +330,16 @@ class PumpClient:
             conn.close()
 
     def _request(self, method: str, path: str,
-                 request_id: Optional[str] = None) -> dict:
+                 request_id: Optional[str] = None,
+                 extra_headers: Optional[dict] = None) -> dict:
         """Performs a request, retrying only what is safe to retry."""
         last_exc: Optional[Exception] = None
 
         with self._lock:
             for attempt in range(self.retries):
                 try:
-                    status, body, raw = self._once(method, path, request_id)
+                    status, body, raw = self._once(method, path, request_id,
+                                                   extra_headers)
                 except (OSError, http.client.HTTPException) as exc:
                     # No response at all. The command may or may not have been
                     # applied -- retrying with the same request ID is exactly
@@ -366,8 +401,8 @@ class PumpClient:
         """GET /v1/status. Safe to call as often as your poll budget allows."""
         return PumpStatus.from_json(self._request("GET", "/v1/status"))
 
-    def _command(self, path: str, prefix: str,
-                 request_id: Optional[str]) -> CommandResult:
+    def _command(self, path: str, prefix: str, request_id: Optional[str],
+                 extra_headers: Optional[dict] = None) -> CommandResult:
         # None means "generate one". An explicitly supplied value -- including
         # the empty string -- is validated, never silently replaced.
         rid = new_request_id(prefix) if request_id is None else request_id
@@ -375,7 +410,8 @@ class PumpClient:
             raise ValueError(
                 f"invalid request id {rid!r}: must be 1-64 chars of "
                 f"A-Z a-z 0-9 - _")
-        body = self._request("POST", path, request_id=rid)
+        body = self._request("POST", path, request_id=rid,
+                             extra_headers=extra_headers)
         return CommandResult(
             accepted=bool(body.get("accepted", False)),
             state=body.get("state", "UNKNOWN"),
@@ -385,7 +421,10 @@ class PumpClient:
             raw=body,
         )
 
-    def start(self, request_id: Optional[str] = None) -> CommandResult:
+    def start(self, request_id: Optional[str] = None, *,
+              choke_ms: Optional[int] = None,
+              crank_ms: Optional[int] = None,
+              unchoke_ms: Optional[int] = None) -> CommandResult:
         """POST /v1/start -- begin the engine start sequence.
 
         Only permitted from IDLE with the recrank cooldown expired; raises
@@ -394,8 +433,27 @@ class PumpClient:
 
         Pass an explicit request_id when retrying the same operator action, so
         a lost response cannot crank the engine twice.
+
+        Optional per-request timing overrides, in milliseconds. Any omitted
+        value uses the device's configured default. Out-of-range values are
+        rejected with PumpClientBug (HTTP 400) rather than silently clamped,
+        so you always know exactly what ran -- in particular crank_ms may
+        never exceed the device's max_crank_ms (see PumpStatus.timings).
+
+            pump.start(crank_ms=3000)             # longer crank, cold engine
+            pump.start(choke_ms=500, crank_ms=1500)
         """
-        return self._command("/v1/start", "start", request_id)
+        extra: dict[str, str] = {}
+        for name, value in (("X-Choke-Ms", choke_ms),
+                            ("X-Crank-Ms", crank_ms),
+                            ("X-Unchoke-Ms", unchoke_ms)):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer "
+                                 f"number of milliseconds, got {value!r}")
+            extra[name] = str(value)
+        return self._command("/v1/start", "start", request_id, extra or None)
 
     def stop(self, request_id: Optional[str] = None) -> CommandResult:
         """POST /v1/stop -- stop immediately, from any state.
@@ -424,6 +482,37 @@ class PumpClient:
         device cannot check for you.
         """
         return self._command("/v1/reset-idle", "reset", request_id)
+
+    # -- maintenance (only present when the device was built with
+    #    ENABLE_MAINTENANCE_API; otherwise every call raises PumpClientBug
+    #    because the routes answer 404) ------------------------------------
+
+    def maintenance(self, relay: str, on: bool,
+                    request_id: Optional[str] = None) -> CommandResult:
+        """POST /v1/maintenance/{relay}/{on|off} -- drive one relay directly.
+
+        `relay` is "choke", "starter" or "kill".
+
+        For bench commissioning only. This bypasses the start/stop sequencing
+        that makes the normal API safe, which is why the device ships with
+        the endpoints disabled -- check PumpStatus.maintenance_api before
+        offering it in a UI.
+
+        The hard interlocks still apply on the device: the starter cannot be
+        energised while the kill circuit is grounded (409), grounding kill
+        releases the starter first, the starter is still force-released at
+        max_crank_ms, and the choke at its own backstop. Manual commands are
+        only accepted from IDLE or UNKNOWN.
+
+        Never wire this into an operator-facing control. It is a screwdriver,
+        not a feature.
+        """
+        if relay not in ("choke", "starter", "kill"):
+            raise ValueError(f"relay must be choke, starter or kill, "
+                             f"got {relay!r}")
+        action = "on" if on else "off"
+        return self._command(f"/v1/maintenance/{relay}/{action}",
+                             f"maint-{relay}-{action}", request_id)
 
 
 # ---------------------------------------------------------------------------

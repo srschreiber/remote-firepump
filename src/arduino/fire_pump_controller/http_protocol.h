@@ -22,8 +22,10 @@
 constexpr size_t HTTP_PATH_MAX   = 96;
 constexpr size_t HTTP_SECRET_MAX = 128;
 
-// Enough for the largest status document with generous slack.
-constexpr size_t HTTP_BODY_MAX   = 640;
+// Enough for the largest status document with generous slack. The test
+// `status_json_fits_the_response_buffer_at_maximum_size` fails if a new field
+// ever pushes the worst case past this.
+constexpr size_t HTTP_BODY_MAX   = 896;
 // Response status line + fixed headers.
 constexpr size_t HTTP_HEAD_MAX   = 192;
 
@@ -51,7 +53,30 @@ struct ParsedRequest {
   bool requestIdPresent = false;
   bool requestIdValid   = false;
   char requestId[REQUEST_ID_MAX_LEN + 1] = {0};
+
+  // Optional per-request start-sequence timing overrides, from the
+  // X-Choke-Ms / X-Crank-Ms / X-Unchoke-Ms headers.
+  //
+  // `*Present` means the header was sent. `timingMalformed` means one of them
+  // was not a plain decimal number that fits in uint32_t, which is a 400
+  // regardless of endpoint. Range checking happens in api_handler.cpp, where
+  // the configured ceilings live.
+  bool     chokeMsPresent   = false;
+  bool     crankMsPresent   = false;
+  bool     unchokeMsPresent = false;
+  bool     timingMalformed  = false;
+  uint32_t chokeMs   = 0;
+  uint32_t crankMs   = 0;
+  uint32_t unchokeMs = 0;
+
+  bool anyTimingOverride() const {
+    return chokeMsPresent || crankMsPresent || unchokeMsPresent;
+  }
 };
+
+// Parses a plain decimal uint32_t. Rejects empty input, any non-digit, and
+// anything that would overflow. No sign, no whitespace, no leading '+'.
+bool parseUint32(const char* s, size_t len, uint32_t& out);
 
 // Incremental, byte-at-a-time HTTP request-header parser.
 //
@@ -156,6 +181,12 @@ struct StatusView {
   int32_t     rssiDbm = 0;
 
   uint32_t cooldownRemainingMs = 0;
+
+  // Timings the current (or most recent) start sequence is using, so a client
+  // can render an accurate progress indicator even when overrides were sent.
+  uint32_t chokePrepMs = CHOKE_PREP_MS;
+  uint32_t crankMs = CRANK_DURATION_MS;
+  uint32_t unchokeDelayMs = UNCHOKE_DELAY_MS;
 
   bool        hasLastCommand = false;
   const char* lastCommandType = "NONE";
