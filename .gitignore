@@ -1,0 +1,19 @@
+# Real credentials — never commit.
+arduino_secrets.h
+
+# Arduino CLI build artefacts
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# Host unit-test artefacts
+src/arduino/tests/build/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~

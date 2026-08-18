@@ -1,0 +1,193 @@
+// pump_controller.h — pure, non-blocking engine control state machine.
+//
+// This translation unit knows nothing about Wi-Fi, HTTP, or JSON. It owns:
+//   * the relay abstraction layer (the ONLY place digitalWrite() is used),
+//   * the hard safety interlocks,
+//   * the start/stop timing state machine,
+//   * the idempotency ring buffer for state-changing commands.
+//
+// Everything is driven by an externally supplied millis() value so the logic
+// stays testable and rollover-safe.
+
+#pragma once
+
+#include <Arduino.h>
+
+#include "config.h"
+
+enum class PumpState : uint8_t {
+  UNKNOWN = 0,
+  IDLE,
+  CHOKING,
+  CRANKING,
+  UNCHOKING,
+  RUNNING_ASSUMED,
+  STOPPING,
+  RETRY_WAIT,
+  FAULT,
+};
+
+enum class CommandType : uint8_t {
+  NONE = 0,
+  START,
+  STOP,
+  START_FAILED,
+  RESET_IDLE,
+};
+
+enum class FaultCode : uint8_t {
+  NONE = 0,
+  STARTER_KILL_CONFLICT,  // starter and kill commanded simultaneously
+  STARTER_OVERRUN,        // starter active beyond MAX_CRANK_MS
+  CHOKE_OVERRUN,          // choke active beyond MAX_CHOKE_MS
+  SPARE_ACTIVE,           // K4 found active; it must never be
+  ILLEGAL_TRANSITION,     // state machine reached an impossible state
+};
+
+// The engine-level interpretation exposed via /v1/status. This is always an
+// assumption: there is no RPM, oil-pressure or flow sensor in this MVP.
+enum class EngineStatus : uint8_t {
+  UNKNOWN_STATUS = 0,
+  STOPPED_ASSUMED,
+  STARTING,
+  RUNNING_ASSUMED_STATUS,
+  STOPPING_STATUS,
+};
+
+struct CommandResult {
+  bool     accepted;
+  bool     duplicate;
+  uint16_t httpStatus;           // 202 on acceptance, 409 on rejection
+  PumpState state;               // state observed after handling
+  uint32_t cooldownRemainingMs;  // recrank cooldown still outstanding
+};
+
+const char* toString(PumpState s);
+const char* toString(CommandType c);
+const char* toString(EngineStatus e);
+// Returns nullptr for FaultCode::NONE so callers can emit JSON null.
+const char* toString(FaultCode f);
+
+class PumpController {
+ public:
+  PumpController() = default;
+
+  // Drives every relay pin to its inactive electrical level and only then
+  // enables it as an output. Call as early as possible in setup().
+  void begin(uint32_t now);
+
+  // Enforce hard safety limits, then advance the state machine. Must be
+  // called from the top of every main-loop iteration, before any networking.
+  void tick(uint32_t now);
+
+  // Handle an authenticated state-changing command. `requestId` may be nullptr
+  // or empty, in which case idempotency tracking is skipped for this call.
+  CommandResult handleCommand(CommandType type, const char* requestId, uint32_t now);
+
+  // --- observers -----------------------------------------------------------
+
+  PumpState state() const { return state_; }
+  FaultCode fault() const { return fault_; }
+  EngineStatus engineStatus() const;
+
+  // Always false in this MVP: nothing physically confirms engine operation.
+  bool runningConfirmed() const { return false; }
+
+  uint32_t stateElapsedMs(uint32_t now) const {
+    return static_cast<uint32_t>(now - stateEnteredAt_);
+  }
+
+  uint32_t cooldownRemainingMs(uint32_t now) const;
+
+  bool starterActive() const { return starterActive_; }
+  bool chokeActive() const { return chokeActive_; }
+  bool killActive() const { return killActive_; }
+  bool spareActive() const { return spareActive_; }
+
+  // True when no relay timing is pending, so a potentially blocking Wi-Fi
+  // operation may be performed without disturbing a safety-critical sequence.
+  bool isQuiescent() const;
+
+  CommandType lastCommandType() const { return lastCommandType_; }
+  const char* lastCommandRequestId() const { return lastCommandRequestId_; }
+  bool lastCommandAccepted() const { return lastCommandAccepted_; }
+  bool hasLastCommand() const { return lastCommandType_ != CommandType::NONE; }
+
+ private:
+#ifdef PUMP_CONTROLLER_TEST_ACCESS
+  // Host unit tests reach the private relay layer directly so the defensive
+  // interlocks can be provoked in isolation, not only through the paths the
+  // state machine happens to take. Compiled out of real firmware.
+  friend struct PumpTestAccess;
+#endif
+
+  // --- relay layer ---------------------------------------------------------
+  // The only functions in the project permitted to call digitalWrite().
+  // Polarity (RELAY_ACTIVE_LOW) is applied exactly once, in setRelayOutput().
+
+  static void setRelayOutput(uint8_t pin, bool active);
+  static void initRelayPin(uint8_t pin);
+
+  void setStarterRelay(bool active);
+  void setChokeRelay(bool active);
+  void setKillRelay(bool active);
+  void setSpareRelay(bool active);
+
+  void allRelaysInactive();
+
+  // --- internals -----------------------------------------------------------
+
+  void enterState(PumpState next);
+  void enterFault(FaultCode code);
+  void enforceSafety(uint32_t now);
+  void advance(uint32_t now);
+
+  void beginStopSequence();
+  void noteStarterReleased();
+
+  bool startPermitted(uint32_t now) const;
+
+  // Idempotency ring buffer.
+  struct CommandRecord {
+    char        requestId[REQUEST_ID_MAX_LEN + 1];
+    CommandType type;
+    uint16_t    httpStatus;
+    bool        accepted;
+    bool        used;
+  };
+
+  const CommandRecord* findRecord(CommandType type, const char* requestId) const;
+  void recordCommand(CommandType type, const char* requestId,
+                     bool accepted, uint16_t httpStatus);
+
+  void rememberLastCommand(CommandType type, const char* requestId, bool accepted);
+
+  // --- state ---------------------------------------------------------------
+
+  PumpState state_        = PumpState::UNKNOWN;
+  FaultCode fault_        = FaultCode::NONE;
+  uint32_t  stateEnteredAt_ = 0;
+  uint32_t  now_          = 0;  // last value passed to tick()/handleCommand()
+
+  bool     starterActive_ = false;
+  bool     chokeActive_   = false;
+  bool     killActive_    = false;
+  bool     spareActive_   = false;
+
+  uint32_t starterOnAt_   = 0;
+  uint32_t chokeOnAt_     = 0;
+
+  uint32_t lastStarterReleaseAt_ = 0;
+  bool     starterEverReleased_  = false;
+
+  // Kill hold performed on entry to FAULT when the engine may be running.
+  bool     faultKillActive_  = false;
+  uint32_t faultKillStartedAt_ = 0;
+
+  CommandRecord records_[IDEMPOTENCY_SLOTS] = {};
+  uint8_t       recordNext_ = 0;
+
+  CommandType lastCommandType_ = CommandType::NONE;
+  char        lastCommandRequestId_[REQUEST_ID_MAX_LEN + 1] = {0};
+  bool        lastCommandAccepted_ = false;
+};
