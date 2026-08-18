@@ -23,6 +23,7 @@
 #include "api_handler.h"
 #include "config.h"
 #include "http_server.h"
+#include "led_matrix.h"
 #include "net_manager.h"
 #include "pump_controller.h"
 
@@ -35,6 +36,7 @@ namespace {
 PumpController g_pump;
 NetManager     g_net;
 HttpServer     g_http;
+StatusMatrix   g_matrix;
 
 #if ENABLE_WATCHDOG
 bool     g_watchdogArmed = false;
@@ -120,6 +122,8 @@ void setup() {
   Serial.println(RELAY_ACTIVE_LOW ? F("LOW") : F("HIGH"));
   Serial.println(F("Initial state: UNKNOWN (engine status unproven after reset)"));
 
+  g_matrix.begin();
+
   g_net.begin(millis());
   g_http.begin();
 
@@ -143,6 +147,10 @@ void loop() {
   //    the controller is quiescent, so reconnection can never stretch out a
   //    starter, choke or kill timing window.
   g_net.tick(now, g_pump.isQuiescent());
+
+  // Cosmetic status display. Last, so it can never delay anything that
+  // matters, and rate-limited internally to a frame every ~100 ms.
+  g_matrix.tick(now, g_pump.state(), g_pump.fault());
 
   if (static_cast<uint32_t>(now - g_lastHeartbeatAt) >= HEARTBEAT_INTERVAL_MS) {
     g_lastHeartbeatAt = now;

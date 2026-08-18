@@ -1,0 +1,471 @@
+# Raspberry Pi integration guide
+
+**Audience:** whoever is building the Raspberry Pi web/API server that sits in
+front of this Arduino.
+
+This document is the **contract**. The Arduino firmware is finished, tested and
+deployed; treat its behaviour here as fixed. If something in this document
+disagrees with the firmware, the firmware wins — file it as a bug.
+
+Read [`../README.md`](../README.md) for the hardware, wiring and safety
+background. This document covers only the Pi's side of the boundary.
+
+---
+
+## 1. Where the Pi sits
+
+```
+iPhone / browser
+  → encrypted Tailscale connection          ← the Pi owns this
+  → Raspberry Pi web/API server             ← YOU ARE BUILDING THIS
+  → unencrypted trusted-LAN HTTP            ← plain HTTP, port 8080
+  → Arduino UNO R4 WiFi                     ← finished firmware
+  → relay module → Honda GX390
+```
+
+**Division of responsibility:**
+
+| Concern | Owner |
+|---|---|
+| Relay timing, choke/crank/kill sequencing | **Arduino** |
+| Safety interlocks, starter ceiling, cooldown | **Arduino** |
+| Deciding whether a command is legal right now | **Arduino** |
+| Idempotency / duplicate suppression | **Arduino** |
+| User authentication, sessions, Tailscale | **Pi** |
+| Operator UX, confirmations, camera feed | **Pi** |
+| History, audit log, notifications | **Pi** |
+| Retry policy for *network* failures | **Pi** |
+
+### Rules the Pi must follow
+
+1. **Never re-implement the safety logic.** Do not add your own cooldown
+   timer, your own "is it safe to start" check, or your own crank duration.
+   The Arduino already enforces all of it and will reject anything illegal
+   with `409`. Duplicating it means two sources of truth that will drift.
+2. **Never auto-retry a failed start.** Not on a timer, not on a schedule, not
+   "just once more". A human must look at the camera and decide. This is a
+   hard product requirement, not a preference.
+3. **`STOP` must always be reachable.** One tap, no confirmation dialog, no
+   nested menu, available from every screen and every state. It is the
+   emergency control.
+4. **Never present `RUNNING_ASSUMED` as "running".** See §6.
+5. **Never expose the Arduino to the internet.** The Pi is the only thing that
+   talks to it. Port 8080 stays on the LAN.
+
+---
+
+## 2. Connection details
+
+| | |
+|---|---|
+| Base URL | `http://<arduino-ip>:8080` |
+| Transport | Plain HTTP/1.1, no TLS |
+| Address | Use the DHCP-reserved IP (e.g. `192.168.1.50`), **not** `.local` |
+| Connections | One request per TCP connection; the device always sends `Connection: close` |
+| Concurrency | **The device serves one client at a time.** Do not open parallel requests. |
+
+### Required headers
+
+```http
+X-Pump-Secret: <the value of PUMP_API_SECRET>
+```
+
+On every request, including `GET /v1/status`. Missing or wrong → `401`.
+
+```http
+X-Request-ID: <unique id>
+```
+
+On every state-changing request. Alphabet `A-Z a-z 0-9 - _`, length 1–64.
+Invalid → `400`. Missing → accepted, but you lose duplicate protection.
+**Always send one.**
+
+### Store the secret properly
+
+Put it in an environment variable or a `0600` file on the Pi. Never in the web
+app's client-side bundle, never in a URL, never in a log line. The browser must
+never see it — the Pi is the only holder.
+
+### Do not hold connections open
+
+There is no keep-alive, no websocket, no server-sent events. Poll
+`/v1/status`. See §5 for cadence.
+
+---
+
+## 3. Endpoints
+
+| Method | Path | Success | Meaning |
+|---|---|---|---|
+| `GET` | `/v1/status` | `200` | Full device state |
+| `POST` | `/v1/start` | `202` | Begin the start sequence |
+| `POST` | `/v1/stop` | `202` | Stop now, from any state |
+| `POST` | `/v1/start-failed` | `202` | Operator says it did not start |
+| `POST` | `/v1/reset-idle` | `202` | Operator confirms engine is stopped |
+
+No request bodies. Any body sent is ignored.
+
+There is deliberately **no endpoint to toggle an individual relay.** If you
+find yourself wanting one, the answer is no.
+
+### `GET /v1/status`
+
+```json
+{
+  "device": "fire-pump-controller",
+  "firmware_version": "0.1.0",
+  "state": "IDLE",
+  "state_elapsed_ms": 12345,
+  "uptime_ms": 456789,
+  "engine_status": "STOPPED_ASSUMED",
+  "running_confirmed": false,
+  "relay_outputs": {
+    "starter": false, "choke": false, "kill": false, "spare": false
+  },
+  "wifi": { "connected": true, "ip": "192.168.1.50", "rssi_dbm": -57 },
+  "cooldown_remaining_ms": 0,
+  "last_command": { "type": "STOP", "request_id": "stop-123", "accepted": true },
+  "fault": null
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | string | One of the nine states in §4 |
+| `state_elapsed_ms` | uint32 | Time in the current state |
+| `uptime_ms` | uint32 | **Wraps at ~49.7 days.** Do not compute durations by subtracting across a poll gap without handling wrap. |
+| `engine_status` | string | `UNKNOWN` / `STOPPED_ASSUMED` / `STARTING` / `RUNNING_ASSUMED` / `STOPPING` |
+| `running_confirmed` | bool | **Always `false`.** See §6. |
+| `relay_outputs` | object | **Commanded** output states, not proof of anything |
+| `cooldown_remaining_ms` | uint32 | Recrank cooldown; `START` is refused while > 0 |
+| `last_command` | object\|null | `null` until the first command since boot |
+| `fault` | string\|null | `null` when healthy; see §7 |
+
+### Command responses (`202`)
+
+```json
+{
+  "accepted": true,
+  "state": "CHOKING",
+  "request_id": "start-001",
+  "duplicate": false,
+  "cooldown_remaining_ms": 0,
+  "running_confirmed": false
+}
+```
+
+`state` is the state **after** the command was applied. `202` means *accepted
+and started*, not *finished* — the sequence runs asynchronously.
+
+### Error responses
+
+All errors are JSON:
+
+```json
+{
+  "accepted": false,
+  "error": "invalid_state_for_command",
+  "message": "command not permitted in the current state",
+  "status": 409,
+  "state": "CRANKING",
+  "cooldown_remaining_ms": 0
+}
+```
+
+| Status | `error` values | What the Pi should do |
+|---|---|---|
+| `400` | `invalid_request_id`, `malformed_request_line`, `malformed_header`, `incomplete_request` | **Bug in your client.** Log loudly, do not retry. |
+| `401` | `unauthorized` | Misconfigured secret. Do not retry. Alert the operator. |
+| `404` | `not_found` | Wrong path. Bug in your client. |
+| `405` | `method_not_allowed` | Wrong verb. Bug in your client. |
+| `409` | `invalid_state_for_command` | **Expected and normal.** Show the reason from `state` / `cooldown_remaining_ms`. Do not retry blindly. |
+| `413` | `headers_too_large`, `request_line_too_long`, `header_line_too_long` | You sent too much. Bug in your client. |
+| `500` | serialisation failures | Should never happen. Log and alert. |
+
+Note `401` is returned **before** routing, so an unknown path with a bad secret
+also returns `401`. That is intentional.
+
+---
+
+## 4. The state machine
+
+You do not need to reimplement this, but your UI must reflect it correctly.
+
+```
+UNKNOWN ──reset-idle──▶ IDLE ──start──▶ CHOKING ──▶ CRANKING ──▶ UNCHOKING ──▶ RUNNING_ASSUMED
+                         ▲                                                        │
+                         │                                            start-failed│
+                         │                                                        ▼
+                         ├──────────────── MIN_RECRANK_GAP ──────────────── RETRY_WAIT
+                         │
+                         └────── KILL_HOLD ────── STOPPING ◀──stop── (ANY state)
+
+                                          FAULT ◀── invariant violated
+```
+
+| State | Meaning | What the Pi should show | START allowed? |
+|---|---|---|---|
+| `UNKNOWN` | Just booted; engine status unproven | "Status unknown — confirm the engine is stopped" + a **Confirm stopped** button | No |
+| `IDLE` | Ready, all relays open | "Ready to start" (or the cooldown, if any) | Yes, if `cooldown_remaining_ms == 0` |
+| `CHOKING` | Choke engaged, pre-crank | "Starting… (choke)" | No |
+| `CRANKING` | Starter engaged | "Starting… (cranking)" | No |
+| `UNCHOKING` | Starter released, choke releasing | "Starting… (releasing choke)" | No |
+| `RUNNING_ASSUMED` | Sequence completed without error | "Start sequence completed — **check the camera**" | No |
+| `STOPPING` | Kill circuit grounded | "Stopping…" | No |
+| `RETRY_WAIT` | Cooling down after a failed start | "Waiting before another attempt: Ns" | No |
+| `FAULT` | Safety invariant tripped | "FAULT: `<fault>`" prominently + recovery action | No |
+
+Approximate timings (authoritative values are in the firmware's `config.h`):
+
+| Constant | Default |
+|---|---|
+| `CHOKE_PREP_MS` | 1000 |
+| `CRANK_DURATION_MS` | 2000 |
+| `UNCHOKE_DELAY_MS` | 500 |
+| `KILL_HOLD_MS` | 3000 |
+| `MIN_RECRANK_GAP_MS` | 10000 |
+
+So a full start takes about **3.5 s** from `202` to `RUNNING_ASSUMED`, and a
+stop takes about **3 s** to return to `IDLE`.
+
+---
+
+## 5. Polling
+
+* **Idle / steady state:** every **2–5 s** is plenty.
+* **During a sequence** (`CHOKING`, `CRANKING`, `UNCHOKING`, `STOPPING`):
+  every **250–500 ms**, so the UI tracks the transitions.
+* **Never faster than ~10 Hz.** The device handles one client at a time; a
+  tight poll loop competes with your own command requests.
+* **Back off when unreachable:** 1 s → 2 s → 5 s → 10 s, capped. Do not hammer
+  a device that is rebooting or off the network.
+
+Use a short timeout (2–3 s connect and read). The device is on the LAN; if it
+does not answer quickly it is not going to.
+
+**Poll from one place.** Run a single background poller that caches the latest
+status, and have all web requests read that cache. Do not let each browser
+client trigger its own request to the Arduino.
+
+---
+
+## 6. `RUNNING_ASSUMED` is not "running"
+
+This is the single most important thing to get right in the UI.
+
+`running_confirmed` is **hardcoded `false`** in this firmware and always will
+be until the hardware gains a real sensor. There is no RPM sensor, no
+oil-pressure switch, no flow meter.
+
+`RUNNING_ASSUMED` means only: *the firmware completed a start sequence without
+tripping an interlock.* It does **not** mean the engine caught, the solenoid
+engaged, a contact closed, or water is moving.
+
+**Do not** display:
+- ❌ "Pump running"
+- ❌ a green "RUNNING" badge
+- ❌ a ✅ tick
+
+**Do** display something like:
+- ✅ "Start sequence completed — **check the camera to confirm**"
+- ✅ "Assumed running (unverified)"
+
+And put the two follow-up actions right there:
+
+| Camera shows | Operator taps | Pi sends |
+|---|---|---|
+| Engine is running | *(nothing — it worked)* | — |
+| Engine did not start | **"Did not start"** | `POST /v1/start-failed` |
+
+That is the whole design: **the operator is the sensor.**
+
+---
+
+## 7. Faults
+
+When `fault` is non-null the device is in `FAULT` and will refuse `START`.
+
+| `fault` | Cause | Severity |
+|---|---|---|
+| `STARTER_OVERRUN` | Starter was active past `MAX_CRANK_MS` — the main loop stalled during a crank | **Investigate.** Alert the operator. |
+| `STARTER_KILL_CONFLICT` | Starter and kill commanded together | **Investigate.** Should be impossible. |
+| `CHOKE_OVERRUN` | Choke active past `MAX_CHOKE_MS` | Investigate |
+| `SPARE_ACTIVE` | K4 found active | Investigate |
+
+Recovery: `POST /v1/stop` (lands in `IDLE`) or `POST /v1/reset-idle`. Both
+clear the fault.
+
+**Log every fault with a timestamp and notify the operator.** A fault means a
+safety backstop fired; it should never be cleared silently by an automatic
+process. Require a deliberate human action.
+
+---
+
+## 8. Request IDs and retries
+
+The Arduino keeps the last **eight accepted** state-changing request IDs. A
+repeat of the same `(request ID, command)` is not re-executed; you get the
+prior result back with `"duplicate": true`.
+
+### Generate one ID per logical operation
+
+```python
+request_id = f"start-{uuid.uuid4().hex[:16]}"   # A-Za-z0-9-_ only, ≤64 chars
+```
+
+**Reuse the same ID when retrying the same logical operation** — that is what
+makes the retry safe. Generate a **new** ID only when the operator asks for a
+genuinely new action.
+
+### Retry policy by failure mode
+
+| Failure | Retry? | How |
+|---|---|---|
+| Connection refused / timeout / no response | **Yes** | Same request ID, up to ~3 attempts, short backoff |
+| `5xx` | Yes, once | Same request ID |
+| `409` | **No** | Expected. Surface the state to the operator. |
+| `400` / `401` / `404` / `405` / `413` | **No** | Your bug or your config. Fix it. |
+
+The dangerous case this protects against: you `POST /v1/start`, the response is
+lost, you retry. With the same ID the engine cranks **once**. With a fresh ID
+it could crank twice.
+
+### `STOP` is special
+
+`STOP` is **exempt from duplicate suppression**. It is still labelled
+`"duplicate": true` if the ID was seen before, but it **always executes**.
+
+Rationale: skipping a stop is dangerous; repeating one merely re-grounds the
+kill circuit for another `KILL_HOLD_MS`.
+
+For the Pi this means:
+- Retrying `STOP` is always safe.
+- Ignore `"duplicate"` on a `STOP` response — treat `202` as success.
+- If you are unsure whether a stop landed, **send it again.**
+
+### Idempotency resets on reboot
+
+The ring buffer is in RAM. After a power cycle the device is in `UNKNOWN`,
+which refuses `START` until an operator resets it — so a replayed `START` from
+before the reboot cannot crank anything.
+
+---
+
+## 9. Operator workflow
+
+Model your UI on this, not on a generic on/off switch.
+
+```
+                    ┌─────────────────────────┐
+                    │ Poll GET /v1/status     │
+                    └───────────┬─────────────┘
+                                ▼
+   state == UNKNOWN ──▶ "Confirm the engine is stopped"
+                          └─▶ POST /v1/reset-idle ──▶ IDLE
+
+   state == IDLE, cooldown 0 ──▶ [ START ] (with a confirmation dialog)
+                          └─▶ POST /v1/start ──▶ CHOKING…RUNNING_ASSUMED
+
+   state == RUNNING_ASSUMED ──▶ "Check the camera"
+                          ├─▶ it started  → done
+                          └─▶ [ Did not start ] → POST /v1/start-failed
+                                                   └─▶ RETRY_WAIT → IDLE
+                                                        (operator may START again)
+
+   ANY state ──▶ [ STOP ]  ← always visible, always enabled
+                  └─▶ POST /v1/stop ──▶ STOPPING ──▶ IDLE
+```
+
+### UI requirements
+
+* **STOP:** always visible, always enabled, no confirmation, visually distinct
+  (large, red). It is the emergency control.
+* **START:** confirmation dialog — this starts a real engine remotely. Disable
+  it whenever `state != "IDLE"` or `cooldown_remaining_ms > 0`, and show why.
+* **Cooldown:** show it counting down, do not just grey out the button.
+* **Camera feed:** put it next to the controls. The operator must be able to
+  confirm without switching apps.
+* **Connectivity:** show clearly when the Arduino is unreachable. A stale
+  status must never look live — display the age of the last successful poll.
+* **Audit log:** record every command with operator identity, timestamp,
+  request ID and the response. This controls a fire pump.
+
+---
+
+## 10. Reference client
+
+A complete, dependency-free client is in
+[`examples/pump_client.py`](examples/pump_client.py) — retries, backoff,
+request-ID handling and typed errors. Lift it directly.
+
+```python
+from pump_client import PumpClient, PumpConflict
+
+pump = PumpClient(host="192.168.1.50", secret=os.environ["PUMP_API_SECRET"])
+
+status = pump.status()
+print(status.state, status.cooldown_remaining_ms)
+
+try:
+    result = pump.start()          # generates a request ID, retries safely
+except PumpConflict as exc:
+    print("not permitted:", exc.state, exc.cooldown_remaining_ms)
+
+pump.stop()                        # always safe to call, always safe to retry
+```
+
+There is also a machine-readable [`openapi.yaml`](openapi.yaml) if you want to
+generate a client in another language.
+
+---
+
+## 11. Testing the Pi without the Arduino
+
+You do not need the hardware to develop against this API.
+
+**Option A — the real device on the bench.** With the engine's 12 V
+contact-side wiring disconnected, `POST /v1/start` just clicks relays. This is
+the highest-fidelity option and what you should test against before release.
+
+**Option B — a stub server.** Implement the five endpoints with the timings in
+§4 and the same status codes. Make sure your stub reproduces:
+
+- `UNKNOWN` on start-up, and `START` → `409` from it
+- `409` from `IDLE` while `cooldown_remaining_ms > 0`
+- `202` with `"duplicate": true` on a replayed `START`
+- `202` on a replayed `STOP` that **still executes**
+- `401` for a wrong secret, including on unknown paths
+- `running_confirmed` always `false`
+
+**Option C — run the firmware's own host tests.** The state machine compiles
+and runs natively; see `src/arduino/tests/`. If you want to check your
+understanding of a state transition, that suite is the executable spec.
+
+### Pi-side tests worth writing
+
+- A lost response to `START` followed by a retry cranks the engine **once**.
+- `409` never triggers an automatic retry.
+- `STOP` is reachable and functional from every UI state.
+- A failed start **never** auto-retries.
+- `RUNNING_ASSUMED` never renders as confirmed "running".
+- The API secret never appears in logs, responses or the client bundle.
+- Arduino unreachable → the UI shows stale/disconnected, not a frozen status.
+
+---
+
+## 12. Checklist before going live
+
+- [ ] Secret stored in an env var or `0600` file, never in the web bundle
+- [ ] DHCP reservation configured for the Arduino's MAC
+- [ ] Port 8080 confirmed **not** reachable from outside the LAN
+- [ ] Tailscale ACLs restrict who can reach the Pi's web app
+- [ ] Single background poller, cached status, sane backoff
+- [ ] `STOP` reachable from every screen, no confirmation
+- [ ] `START` behind a confirmation dialog
+- [ ] No automatic retry anywhere in the codebase
+- [ ] `RUNNING_ASSUMED` never worded as confirmed running
+- [ ] Camera feed adjacent to the controls
+- [ ] Audit log of every command with operator identity
+- [ ] Faults raise a notification and require deliberate human clearing
+- [ ] Bench-tested end to end against the real Arduino with the 12 V side
+      disconnected

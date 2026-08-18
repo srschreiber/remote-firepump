@@ -153,6 +153,17 @@ constexpr size_t   HTTP_BYTES_PER_PASS = 128;
 constexpr uint8_t  IDEMPOTENCY_SLOTS = 8;
 
 // ---------------------------------------------------------------------------
+// LED matrix status display (cosmetic)
+// ---------------------------------------------------------------------------
+//
+// Replaces the board's factory "heart" animation with a dancing flame whose
+// height tracks the controller state. Set to 0 to leave the matrix dark.
+// See led_matrix.h; it does not touch D2-D5 or any relay line.
+#ifndef ENABLE_LED_MATRIX
+#define ENABLE_LED_MATRIX 1
+#endif
+
+// ---------------------------------------------------------------------------
 // Watchdog
 // ---------------------------------------------------------------------------
 //

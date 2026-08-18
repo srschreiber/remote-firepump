@@ -1,0 +1,484 @@
+openapi: 3.1.0
+
+info:
+  title: Fire Pump Controller API
+  version: 0.1.0
+  description: |
+    LAN control API for an Arduino UNO R4 WiFi that operates the electric
+    start, choke and ignition-kill circuits of a Honda GX390 water pump.
+
+    **The Arduino owns all relay timing and every safety interlock.** Callers
+    send high-level commands only; there is deliberately no endpoint that
+    operates an individual relay.
+
+    ## Security model
+
+    Plain HTTP on a trusted LAN, authenticated with a shared secret in the
+    `X-Pump-Secret` header. There is no TLS. **This API must never be exposed
+    outside the LAN or port-forwarded to the internet.** The intended topology
+    puts a Raspberry Pi in front of it, reachable over Tailscale.
+
+    Authentication is checked *before* routing, so an unauthenticated caller
+    receives `401` even for unknown paths and cannot enumerate endpoints.
+
+    ## Important caveats
+
+    * `running_confirmed` is **always `false`**. This build has no RPM,
+      oil-pressure or flow sensor. `RUNNING_ASSUMED` means only that a start
+      sequence completed without tripping an interlock — never that the engine
+      actually caught. A human confirms that from the security cameras.
+    * `relay_outputs` are **commanded** output states. They do not prove a
+      relay moved or a contact closed.
+    * The device serves **one request per TCP connection** and handles one
+      client at a time. Do not issue parallel requests.
+
+  license:
+    name: See repository
+
+servers:
+  - url: http://192.168.1.50:8080
+    description: Example DHCP-reserved address on the property LAN
+
+tags:
+  - name: status
+  - name: commands
+
+paths:
+  /v1/status:
+    get:
+      tags: [status]
+      summary: Read the full device state
+      description: |
+        Safe to poll. Suggested cadence: 2–5 s when idle, 250–500 ms while a
+        timing sequence is active (`CHOKING`, `CRANKING`, `UNCHOKING`,
+        `STOPPING`). Never faster than ~10 Hz.
+      operationId: getStatus
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+      responses:
+        '200':
+          description: Current state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Status' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /v1/start:
+    post:
+      tags: [commands]
+      summary: Begin the complete engine start sequence
+      description: |
+        Permitted **only** from `IDLE`, and only once the recrank cooldown has
+        expired. Returns `202` as soon as the sequence is accepted; it then
+        runs asynchronously on the device for roughly 3.5 s:
+
+        1. Ensure kill open and starter inactive
+        2. Activate choke → `CHOKING`
+        3. After `CHOKE_PREP_MS` (1000 ms) activate starter → `CRANKING`
+        4. After `CRANK_DURATION_MS` (2000 ms) release starter → `UNCHOKING`
+        5. After `UNCHOKE_DELAY_MS` (500 ms) release choke → `RUNNING_ASSUMED`
+
+        There is **no automatic retry** if the engine fails to start.
+      operationId: startPump
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /v1/stop:
+    post:
+      tags: [commands]
+      summary: Stop immediately, from any state
+      description: |
+        **STOP has priority over every other operation** and is accepted from
+        every state without exception: `UNKNOWN`, `IDLE`, `CHOKING`,
+        `CRANKING`, `UNCHOKING`, `RUNNING_ASSUMED`, `STOPPING`, `RETRY_WAIT`,
+        `FAULT`. It is never rejected merely because another operation is
+        active, and never returns `409`.
+
+        Effect, in this order: deactivate starter, deactivate choke, activate
+        kill, enter `STOPPING`, hold kill for `KILL_HOLD_MS` (3000 ms),
+        release kill, enter `IDLE`.
+
+        **Exempt from duplicate suppression.** A replayed request ID is still
+        labelled `duplicate: true` but the stop is always executed — skipping
+        a stop is dangerous, repeating one merely re-grounds the kill circuit.
+        Always safe to retry; treat `202` as success and ignore `duplicate`.
+      operationId: stopPump
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /v1/start-failed:
+    post:
+      tags: [commands]
+      summary: Operator confirms the previous start did not work
+      description: |
+        Sent after a human checks the camera and sees that the engine did not
+        catch. Ensures starter, choke and kill are all inactive, enters
+        `RETRY_WAIT`, enforces `MIN_RECRANK_GAP_MS` (10000 ms) from the last
+        starter release, then falls back to `IDLE`.
+
+        **It never initiates an automatic retry.** The operator must issue a
+        fresh `START`.
+
+        Accepted from `RUNNING_ASSUMED` (the normal case) and from
+        `RETRY_WAIT`, `IDLE` and `UNKNOWN`, where it is a safe no-op.
+        Rejected with `409` during an active sequence or from `FAULT`.
+      operationId: reportStartFailed
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /v1/reset-idle:
+    post:
+      tags: [commands]
+      summary: Operator confirms the engine is stopped after a reboot
+      description: |
+        After any power-on or watchdog reset the device reports `UNKNOWN` and
+        refuses `START`, because it cannot know whether the engine is running.
+        This endpoint is how a human asserts that it is stopped.
+
+        Deactivates all relays, clears any fault, honours any outstanding
+        recrank cooldown, and transitions to `IDLE` (or `RETRY_WAIT` if the
+        cooldown has not expired).
+
+        Accepted from `UNKNOWN`, `IDLE`, `RETRY_WAIT` and `FAULT`. Rejected
+        with `409` during an active sequence.
+
+        **Only send this once a human has actually verified the engine is not
+        running.** The device cannot check, and does not infer engine state
+        from relay state.
+      operationId: resetIdle
+      parameters:
+        - $ref: '#/components/parameters/PumpSecret'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+components:
+
+  parameters:
+    PumpSecret:
+      name: X-Pump-Secret
+      in: header
+      required: true
+      description: |
+        Shared secret, matching `PUMP_API_SECRET` in the device's
+        `arduino_secrets.h`. Compared in constant time. Never logged by the
+        device and never echoed in a response. If the device is configured
+        with an empty secret it fails closed and answers `401` to everything.
+      schema:
+        type: string
+      example: replace-with-a-long-random-secret
+
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Idempotency key for state-changing requests. The device remembers the
+        last **eight accepted** `(request id, command)` pairs; a repeat is not
+        executed again and the response carries `duplicate: true`.
+
+        **Reuse the same ID when retrying the same logical operation** — that
+        is what makes a lost response safe. Generate a new one only for a
+        genuinely new operator action.
+
+        Strongly recommended on every state-changing request. Omitting it is
+        accepted but forfeits duplicate protection.
+
+        `STOP` is exempt from suppression: see `/v1/stop`.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,64}$'
+        maxLength: 64
+      example: start-001
+
+  responses:
+    CommandAccepted:
+      description: |
+        Command accepted and started. The sequence runs asynchronously; this
+        response does not wait for it to complete.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CommandResult' }
+
+    BadRequest:
+      description: |
+        Malformed request or an invalid `X-Request-ID`. Indicates a client
+        bug — do not retry.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    Unauthorized:
+      description: |
+        Missing or incorrect `X-Pump-Secret`. Returned before routing, so an
+        unknown path with a bad secret also yields `401`. Do not retry; fix
+        the configuration.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            accepted: false
+            error: unauthorized
+            message: missing or incorrect X-Pump-Secret
+            status: 401
+            state: null
+
+    NotFound:
+      description: Unknown endpoint (authenticated callers only).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    MethodNotAllowed:
+      description: Known path, wrong HTTP method.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    Conflict:
+      description: |
+        Authenticated and well-formed, but the command is not permitted in the
+        current state. **This is a normal outcome**, not an error condition —
+        for example `START` during the recrank cooldown. Surface `state` and
+        `cooldown_remaining_ms` to the operator; do not retry automatically.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            accepted: false
+            error: invalid_state_for_command
+            message: command not permitted in the current state
+            status: 409
+            state: UNKNOWN
+            cooldown_remaining_ms: 0
+
+    PayloadTooLarge:
+      description: |
+        Request line > 256 bytes, a single header line > 256 bytes, or the
+        total header block > 2 KB.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    PumpState:
+      type: string
+      enum: [UNKNOWN, IDLE, CHOKING, CRANKING, UNCHOKING, RUNNING_ASSUMED,
+             STOPPING, RETRY_WAIT, FAULT]
+      description: |
+        * `UNKNOWN` — after every power-on or watchdog reset. Engine state
+          unproven; `START` refused until an operator sends `/v1/reset-idle`.
+        * `IDLE` — ready; all relays open.
+        * `CHOKING` — choke engaged, waiting `CHOKE_PREP_MS` before cranking.
+        * `CRANKING` — starter engaged.
+        * `UNCHOKING` — starter released, waiting to release the choke.
+        * `RUNNING_ASSUMED` — sequence completed without error. **Assumed, not
+          measured.**
+        * `STOPPING` — kill circuit grounded for `KILL_HOLD_MS`.
+        * `RETRY_WAIT` — enforcing the minimum interval between starter
+          attempts; falls back to `IDLE`. Never auto-retries.
+        * `FAULT` — a safety invariant tripped. Sticky until cleared by
+          `/v1/stop` or `/v1/reset-idle`.
+
+    EngineStatus:
+      type: string
+      enum: [UNKNOWN, STOPPED_ASSUMED, STARTING, RUNNING_ASSUMED, STOPPING]
+      description: Interpretation of the state. Always an assumption.
+
+    FaultCode:
+      type: [string, "null"]
+      enum: [null, STARTER_KILL_CONFLICT, STARTER_OVERRUN, CHOKE_OVERRUN,
+             SPARE_ACTIVE, ILLEGAL_TRANSITION]
+      description: |
+        * `STARTER_KILL_CONFLICT` — starter and kill commanded together.
+        * `STARTER_OVERRUN` — starter active past `MAX_CRANK_MS` (5000 ms),
+          which implies the main loop stalled during a crank. Investigate.
+        * `CHOKE_OVERRUN` — choke active past `MAX_CHOKE_MS` (30000 ms).
+        * `SPARE_ACTIVE` — K4 found active; it must never be.
+        * `ILLEGAL_TRANSITION` — the state machine reached an impossible state.
+
+    RelayOutputs:
+      type: object
+      description: |
+        The Arduino's **commanded** output states. These do not prove that the
+        physical relay moved, that a contact closed, or that the engine did
+        anything. `spare` (K4) is always `false`.
+      required: [starter, choke, kill, spare]
+      properties:
+        starter: { type: boolean, description: K1 — starter solenoid trigger }
+        choke:   { type: boolean, description: K2 — choke actuator trigger }
+        kill:    { type: boolean, description: K3 — ignition kill to ground }
+        spare:   { type: boolean, description: K4 — always false }
+
+    WifiInfo:
+      type: object
+      required: [connected, ip, rssi_dbm]
+      properties:
+        connected: { type: boolean }
+        ip:        { type: string, examples: ["192.168.1.50"] }
+        rssi_dbm:  { type: integer, examples: [-57] }
+
+    LastCommand:
+      type: [object, "null"]
+      description: The most recent state-changing command, or null since boot.
+      properties:
+        type:
+          type: string
+          enum: [NONE, START, STOP, START_FAILED, RESET_IDLE]
+        request_id: { type: string }
+        accepted:   { type: boolean }
+
+    Status:
+      type: object
+      required:
+        [device, firmware_version, state, state_elapsed_ms, uptime_ms,
+         engine_status, running_confirmed, relay_outputs, wifi,
+         cooldown_remaining_ms, last_command, fault]
+      properties:
+        device:
+          type: string
+          examples: ["fire-pump-controller"]
+        firmware_version:
+          type: string
+          examples: ["0.1.0"]
+        state:
+          $ref: '#/components/schemas/PumpState'
+        state_elapsed_ms:
+          type: integer
+          minimum: 0
+          description: Milliseconds spent in the current state.
+        uptime_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Milliseconds since boot. **Wraps at 2^32 ms (~49.7 days).** Handle
+            wrap when computing durations across polls.
+        engine_status:
+          $ref: '#/components/schemas/EngineStatus'
+        running_confirmed:
+          type: boolean
+          const: false
+          description: |
+            **Always `false`.** There is no RPM, oil-pressure, water-flow or
+            engine-running sensor in this build. Never render this state as
+            confirmed "running" in a UI.
+        relay_outputs:
+          $ref: '#/components/schemas/RelayOutputs'
+        wifi:
+          $ref: '#/components/schemas/WifiInfo'
+        cooldown_remaining_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Remaining recrank cooldown, measured from the last starter
+            release. `START` is refused with `409` while this is above zero.
+        last_command:
+          $ref: '#/components/schemas/LastCommand'
+        fault:
+          $ref: '#/components/schemas/FaultCode'
+
+    CommandResult:
+      type: object
+      required: [accepted, state, request_id, duplicate,
+                 cooldown_remaining_ms, running_confirmed]
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        state:
+          $ref: '#/components/schemas/PumpState'
+          description: State **after** the command was applied.
+        request_id:
+          type: string
+          description: Echo of `X-Request-ID`, or "" if none was supplied.
+        duplicate:
+          type: boolean
+          description: |
+            True when this `(request id, command)` pair was seen before. For
+            every command except `STOP` it means the command was **not**
+            executed again. For `STOP` it is informational only — the stop was
+            still performed.
+        cooldown_remaining_ms:
+          type: integer
+          minimum: 0
+        running_confirmed:
+          type: boolean
+          const: false
+
+    Error:
+      type: object
+      required: [accepted, error, message, status, state]
+      properties:
+        accepted:
+          type: boolean
+          const: false
+        error:
+          type: string
+          description: Stable machine-readable code.
+          examples:
+            - unauthorized
+            - invalid_state_for_command
+            - invalid_request_id
+            - not_found
+            - method_not_allowed
+            - headers_too_large
+            - request_line_too_long
+            - header_line_too_long
+            - malformed_request_line
+            - malformed_request_target
+            - malformed_header
+            - incomplete_request
+        message:
+          type: string
+          description: Human-readable explanation. Never contains a secret.
+        status:
+          type: integer
+        state:
+          oneOf:
+            - $ref: '#/components/schemas/PumpState'
+            - type: "null"
+          description: Null on `401`, which is answered before routing.
+        cooldown_remaining_ms:
+          type: integer
+          minimum: 0
+          description: Present on `409` responses.
+
+  securitySchemes:
+    PumpSecret:
+      type: apiKey
+      in: header
+      name: X-Pump-Secret
+
+security:
+  - PumpSecret: []
