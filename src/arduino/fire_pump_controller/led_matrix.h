@@ -4,11 +4,16 @@
 // height reflects the controller state, so the pump's status is readable at a
 // glance from across the shed.
 //
-//   UNKNOWN / IDLE / RETRY_WAIT   small ember, slow
-//   CHOKING / CRANKING / UNCHOKING flame building
-//   RUNNING_ASSUMED               full flame, dancing fast
-//   STOPPING                      flame collapsing
-//   FAULT                         blinking X (deliberately not flame-shaped)
+//   UNKNOWN / IDLE / RETRY_WAIT    small flame, gentle flicker
+//   CHOKING / STOPPING             medium flame
+//   CRANKING / UNCHOKING           full flame, dancing fast
+//   RUNNING_ASSUMED                full flame
+//   FAULT                          blinking X (deliberately not flame-shaped)
+//
+// Three separately drawn sizes, each a complete flame with its own moving
+// tip. An earlier version drew one flame and masked its top rows away by
+// state, which removed the taper that reads as "flame" and left the resting
+// animation looking like two rows of blocks twitching.
 //
 // This is cosmetic and entirely optional. It is compiled out with
 // ENABLE_LED_MATRIX=0.
@@ -43,7 +48,7 @@ class StatusMatrix {
   void tick(uint32_t now, PumpState state, FaultCode fault);
 
  private:
-  void render(const uint16_t rows[8], uint8_t visibleRows);
+  void render(const uint16_t rows[8]);
 
   bool     started_ = false;
   uint32_t lastFrameAt_ = 0;
