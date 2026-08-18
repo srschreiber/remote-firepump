@@ -41,6 +41,10 @@ void NetManager::startAttempt(uint32_t now) {
   lastPollAt_ = now;
 }
 
+bool NetManager::haveAddress() const {
+  return ip_[0] != '\0' && strcmp(ip_, "0.0.0.0") != 0;
+}
+
 void NetManager::refreshLinkInfo() {
   const IPAddress ip = WiFi.localIP();
   snprintf(ip_, sizeof(ip_), "%u.%u.%u.%u",
@@ -57,6 +61,12 @@ void NetManager::refreshLinkInfo() {
 }
 
 void NetManager::tick(uint32_t now, bool radioReconnectAllowed) {
+  if (suspended_) {
+    // Someone else owns the radio right now. Relay timing is unaffected --
+    // the pump state machine never depends on the network.
+    return;
+  }
+
   switch (phase_) {
     case Phase::IDLE_START:
       if (radioReconnectAllowed) {
@@ -71,13 +81,41 @@ void NetManager::tick(uint32_t now, bool radioReconnectAllowed) {
       lastPollAt_ = now;
 
       if (WiFi.status() == WL_CONNECTED) {
-        refreshLinkInfo();
+        // Associated, but DHCP has almost certainly not bound yet. Announcing
+        // now would advertise 0.0.0.0 as the device address.
+        Serial.println(F("[WIFI] associated; waiting for DHCP"));
+        phase_ = Phase::AWAIT_IP;
+        phaseStartedAt_ = now;
+      } else if (static_cast<uint32_t>(now - phaseStartedAt_) >= WIFI_CONNECT_TIMEOUT_MS) {
+        Serial.println(F("[WIFI] association timed out; backing off"));
+        phase_ = Phase::BACKOFF;
+        phaseStartedAt_ = now;
+      }
+      break;
+    }
+
+    case Phase::AWAIT_IP: {
+      if (static_cast<uint32_t>(now - lastPollAt_) < WIFI_POLL_INTERVAL_MS) {
+        break;
+      }
+      lastPollAt_ = now;
+
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println(F("[WIFI] lost association before DHCP completed"));
+        phase_ = Phase::BACKOFF;
+        phaseStartedAt_ = now;
+        break;
+      }
+
+      refreshLinkInfo();
+      if (haveAddress()) {
         phase_ = Phase::CONNECTED;
         phaseStartedAt_ = now;
         Serial.println(F("[WIFI] connected"));
         printBanner();
-      } else if (static_cast<uint32_t>(now - phaseStartedAt_) >= WIFI_CONNECT_TIMEOUT_MS) {
-        Serial.println(F("[WIFI] association timed out; backing off"));
+      } else if (static_cast<uint32_t>(now - phaseStartedAt_) >= DHCP_TIMEOUT_MS) {
+        Serial.println(F("[WIFI] DHCP did not bind an address; retrying"));
+        strcpy(ip_, "0.0.0.0");
         phase_ = Phase::BACKOFF;
         phaseStartedAt_ = now;
       }

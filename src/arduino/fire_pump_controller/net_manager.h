@@ -36,6 +36,23 @@ class NetManager {
 
   bool isConnected() const { return phase_ == Phase::CONNECTED; }
 
+  // Pauses the reconnect state machine so another caller can own the radio
+  // for a moment -- a network scan, for example. WiFiS3 shares one AT link
+  // with the ESP32-S3, so a scan issued while an association is in flight
+  // returns nothing useful.
+  void suspend() { suspended_ = true; }
+
+  // Resumes and schedules an association attempt on the next tick.
+  void resume(uint32_t now) {
+    suspended_ = false;
+    phase_ = Phase::BACKOFF;
+    // Backdate the timer so the retry is immediate rather than waiting out
+    // another full interval.
+    phaseStartedAt_ = static_cast<uint32_t>(now - WIFI_RETRY_INTERVAL_MS);
+  }
+
+  bool isSuspended() const { return suspended_; }
+
   const char* ipString() const { return ip_; }
   const char* macString() const { return mac_; }
   const char* ssidString() const { return ssid_; }
@@ -48,14 +65,21 @@ class NetManager {
   enum class Phase : uint8_t {
     IDLE_START,   // nothing attempted yet
     CONNECTING,   // association requested, awaiting WL_CONNECTED
-    CONNECTED,    // associated; link polled periodically
+    AWAIT_IP,     // associated, waiting for DHCP to bind a lease
+    CONNECTED,    // associated with an address; link polled periodically
     BACKOFF,      // waiting out WIFI_RETRY_INTERVAL_MS before retrying
   };
+
+  // True once localIP() is something other than 0.0.0.0. Association and
+  // DHCP completion are separate events: WL_CONNECTED arrives first, and
+  // querying the address at that moment yields 0.0.0.0.
+  bool haveAddress() const;
 
   void startAttempt(uint32_t now);
   void refreshLinkInfo();
   void captureMac();
 
+  bool     suspended_ = false;
   Phase    phase_ = Phase::IDLE_START;
   uint32_t phaseStartedAt_ = 0;
   uint32_t lastPollAt_ = 0;

@@ -26,6 +26,7 @@
 #include "led_matrix.h"
 #include "net_manager.h"
 #include "pump_controller.h"
+#include "serial_console.h"
 
 #if ENABLE_WATCHDOG
 #include <WDT.h>
@@ -37,6 +38,7 @@ PumpController g_pump;
 NetManager     g_net;
 HttpServer     g_http;
 StatusMatrix   g_matrix;
+SerialConsole  g_console;
 
 #if ENABLE_WATCHDOG
 bool     g_watchdogArmed = false;
@@ -123,6 +125,7 @@ void setup() {
   Serial.println(F("Initial state: UNKNOWN (engine status unproven after reset)"));
 
   g_matrix.begin();
+  g_console.begin();
 
   g_net.begin(millis());
   g_http.begin();
@@ -143,10 +146,50 @@ void loop() {
   //        one. Both are bounded and never wait for a byte.
   g_http.service(now, g_pump, g_net);
 
+  // 4b. Bench console over USB, when compiled in. Bounded and non-blocking.
+  g_console.tick(now, g_pump, g_net);
+
+  // 4c. A requested network scan. Done here rather than in the console
+  //     because WiFi.scanNetworks() blocks for several seconds -- close to
+  //     the watchdog period -- so the watchdog is fed either side of it.
+  //     The console only accepts the request while the relays are idle.
+  if (g_console.wantsScan()) {
+    g_console.clearScanRequest();
+
+    // Take the radio away from the reconnect loop first. WiFiS3 multiplexes
+    // one AT link to the ESP32-S3, so scanning while an association is in
+    // flight just returns an empty list.
+    g_net.suspend();
+    feedWatchdog();
+    WiFi.disconnect();
+    feedWatchdog();
+
+    const int found = WiFi.scanNetworks();
+    feedWatchdog();
+    Serial.print(F("networks found: "));
+    Serial.println(found);
+    for (int i = 0; i < found; ++i) {
+      Serial.print(F("  ["));
+      Serial.print(i);
+      Serial.print(F("] rssi "));
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(F(" dBm  enc "));
+      Serial.print(WiFi.encryptionType(i));
+      Serial.print(F("  ssid \""));
+      Serial.print(WiFi.SSID(i));
+      Serial.println(F("\""));
+    }
+    Serial.println(F("(only 2.4 GHz networks can appear; this radio has no 5 GHz)"));
+    feedWatchdog();
+
+    g_net.resume(millis());
+  }
+
   // 5. Wi-Fi maintenance. A new association is only ever *initiated* while
   //    the controller is quiescent, so reconnection can never stretch out a
-  //    starter, choke or kill timing window.
-  g_net.tick(now, g_pump.isQuiescent());
+  //    starter, choke or kill timing window. A running lamp test counts as
+  //    busy, so the radio is left alone while relays are being pulsed.
+  g_net.tick(now, g_pump.isQuiescent() && !g_console.lampTestActive());
 
   // Cosmetic status display. Last, so it can never delay anything that
   // matters, and rate-limited internally to a frame every ~100 ms.

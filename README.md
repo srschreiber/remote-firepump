@@ -42,6 +42,7 @@ Start here instead:
 
 | Document | Purpose |
 |---|---|
+| **[pump-gateway/README.md](pump-gateway/README.md)** | **The Pi side, already built.** A Go web gateway that implements this contract: Tailscale-authenticated PWA, single cached poller, command log, one high-level command per tap, systemd unit and installer. Start there unless you are writing a different client. |
 | **[docs/PI_INTEGRATION.md](docs/PI_INTEGRATION.md)** | **The integration contract.** Division of responsibility, endpoint semantics, retry policy, polling cadence, operator workflow, UI requirements, go-live checklist. |
 | [docs/openapi.yaml](docs/openapi.yaml) | Machine-readable OpenAPI 3.1 spec for generating clients |
 | [docs/examples/pump_client.py](docs/examples/pump_client.py) | Reference Python client — retries, backoff, request IDs, typed errors, background poller |
@@ -628,6 +629,45 @@ Accepted from `RUNNING_ASSUMED` (the normal case), and also from `RETRY_WAIT`,
 `IDLE` and `UNKNOWN`, where it is a safe no-op that re-asserts "all relays
 off". Rejected with `409` during an active sequence or from `FAULT`.
 
+### Serial bench console (disabled by default)
+
+The HTTP API is unreachable until Wi-Fi is configured, which leaves no way to
+prove the Arduino-to-relay wiring on a fresh install. The serial console gives
+you one over the USB cable alone.
+
+Enable in `config.h`, then upload:
+
+```cpp
+#define ENABLE_SERIAL_CONSOLE 1
+```
+
+Open the Serial Monitor at 115200 and type commands (newline-terminated):
+
+| Command | Effect |
+| ------- | ------ |
+| `help` | list commands |
+| `status` | state, relay outputs, **live pin levels**, Wi-Fi, fault |
+| `test` | **lamp test** — pulses K2, K1, K3 in turn, ~600 ms each |
+| `scan` | list visible 2.4 GHz networks (SSIDs are case-sensitive!) |
+| `choke on\|off`, `starter on\|off`, `kill on\|off` | drive one relay |
+| `start`, `stop`, `failed`, `reset` | the normal API commands |
+
+`test` is the fastest way to prove the wiring: you should see `IN2`, then
+`IN1`, then `IN3` light and click in that order, with `IN4` never touched.
+
+`scan` is how you confirm an SSID exactly — it is case-sensitive, and the
+UNO R4 WiFi has **no 5 GHz radio**, so a network that does not appear in the
+scan cannot be joined.
+
+Every command goes through `PumpController`, so every interlock still applies.
+The lamp test refuses to run outside `IDLE`/`UNKNOWN`, and its starter pulse is
+far below `MAX_CRANK_MS` (which still applies regardless).
+
+> ⚠️ **Turn this off before the controller goes on the engine.** It drives real
+> relays, and a stray keystroke would crank. Anyone with USB access can already
+> reflash the board, so it adds no *remote* attack surface — but it is a
+> commissioning tool, not a deployment feature.
+
 ### Maintenance API (disabled by default)
 
 For bench commissioning, the firmware can expose direct relay control:
@@ -1158,9 +1198,28 @@ Your module is active-high. Set `RELAY_ACTIVE_LOW = false` in `config.h` and
 re-upload. Re-run the host tests; they cover both polarities.
 
 **Device never appears on the LAN**
-Confirm the network is 2.4 GHz — the UNO R4 WiFi has no 5 GHz radio. Check the
-Serial banner for the association attempt. Verify the SSID and password in
-`arduino_secrets.h`.
+Enable the [serial console](#serial-bench-console-disabled-by-default) and run
+`scan`. It lists exactly what the radio can see.
+
+* **SSID not in the list** → it is 5 GHz only. The UNO R4 WiFi has no 5 GHz
+  radio. Enable a 2.4 GHz SSID on your router.
+* **SSID in the list but not connecting** → compare it character for character
+  with `arduino_secrets.h`. **SSIDs are case-sensitive**, and this cost real
+  time during commissioning: `My Wifi` silently fails against a network
+  actually named `My WiFi`. The only symptom is an endless
+  `associating… / association timed out` loop with no other clue. Copy the
+  SSID out of the `scan` output rather than typing it.
+
+**`[WIFI] associated; waiting for DHCP` then a retry**
+The access point accepted the association but no DHCP lease arrived within
+`DHCP_TIMEOUT_MS`. Check the router's DHCP pool is not exhausted, and that MAC
+filtering is not blocking the device.
+
+**No relay LEDs ever light**
+That is correct until something commands a relay. With `RELAY_ACTIVE_LOW`, an
+inactive relay means the pin is driven **HIGH**, so `IN1`–`IN4` are dark and
+the coils are de-energised. Prove the wiring with the serial console's `test`
+command, or watch `IN2`/`IN1` during a `POST /v1/start`.
 
 **`fire-pump-controller.local` does not resolve**
 Expected. Setting a DHCP hostname is not mDNS. Use the IP address with a DHCP
@@ -1203,6 +1262,14 @@ remote-firepump/
 │       ├── pump_client.py         reference Python client
 │       ├── stub_server.py         API stub for hardware-free development
 │       └── test_examples.py       client-vs-stub self-test
+├── pump-gateway/                  the Raspberry Pi side (Go)
+│   ├── README.md                  gateway, deployment and Tailscale guide
+│   ├── cmd/pump-gateway/          the service: web app + Arduino proxy
+│   ├── cmd/mock-arduino/          software stand-in for this firmware
+│   ├── internal/                  client, auth, config, monitor, server, events
+│   ├── web/                       the embedded PWA (no CDN, no build step)
+│   ├── deploy/                    systemd unit, env template, installer
+│   └── test/e2e/                  runs the built binaries as processes
 └── src/arduino/
     ├── fire_pump_controller/
     │   ├── fire_pump_controller.ino    main loop and setup

@@ -141,6 +141,39 @@ static_assert(UNCHOKE_DELAY_MS <= MAX_UNCHOKE_DELAY_OVERRIDE_MS,
 
 constexpr bool MAINTENANCE_API_ENABLED = (ENABLE_MAINTENANCE_API != 0);
 
+// ---------------------------------------------------------------------------
+// Serial bench console
+// ---------------------------------------------------------------------------
+//
+// A commissioning console over the USB cable, for proving the Arduino-to-relay
+// wiring before Wi-Fi is configured (see serial_console.h). Includes a lamp
+// test that pulses each relay in turn.
+//
+// OFF BY DEFAULT. It drives real relays, so turn it off before the controller
+// goes on the engine. Every interlock still applies while it is on.
+// NOTE: currently ENABLED for bench commissioning. Set back to 0 before the
+// controller goes on the engine.
+#ifndef ENABLE_SERIAL_CONSOLE
+#define ENABLE_SERIAL_CONSOLE 1
+#endif
+
+// Longest console command line accepted; longer lines are discarded.
+constexpr size_t SERIAL_LINE_MAX = 48;
+
+// Bytes drained from the USB serial buffer per main-loop pass, so a paste of
+// text cannot stall the state machine.
+constexpr size_t SERIAL_BYTES_PER_PASS = 32;
+
+// How long the lamp test energises each relay. Well under MAX_CRANK_MS, which
+// still applies to the starter pulse regardless.
+constexpr uint32_t LAMP_TEST_PULSE_MS = 600;
+
+// Gap between lamp-test pulses, so each click is distinguishable.
+constexpr uint32_t LAMP_TEST_GAP_MS = 400;
+
+static_assert(LAMP_TEST_PULSE_MS < MAX_CRANK_MS,
+              "a lamp-test starter pulse must stay inside the starter ceiling");
+
 static_assert(CRANK_DURATION_MS <= MAX_CRANK_MS,
               "CRANK_DURATION_MS must not exceed MAX_CRANK_MS");
 static_assert(MAX_CRANK_MS <= 5000,
@@ -171,6 +204,11 @@ constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 // How often link status is polled.
 constexpr uint32_t WIFI_POLL_INTERVAL_MS = 1000;
 
+// After association, how long to wait for DHCP to bind an address before
+// giving up and retrying. WL_CONNECTED arrives well before the lease does;
+// announcing at that moment would advertise 0.0.0.0 as the device address.
+constexpr uint32_t DHCP_TIMEOUT_MS = 15000;
+
 // HTTP request limits. Anything larger is rejected with 413.
 constexpr size_t   HTTP_MAX_REQUEST_LINE = 256;   // "POST /v1/start HTTP/1.1"
 constexpr size_t   HTTP_MAX_HEADER_BYTES = 2048;  // total header section
@@ -181,6 +219,15 @@ constexpr size_t   HTTP_MAX_LINE_BYTES   = 256;   // any single header line
 
 // A client that cannot get its headers in within this window is dropped.
 constexpr uint32_t HTTP_CLIENT_TIMEOUT_MS = 3000;
+
+// Minimum spacing between accept polls. WiFiServer::available() is a full AT
+// round-trip to the ESP32, and the main loop runs thousands of times a
+// second, so polling it every iteration keeps the modem link permanently
+// busy for no benefit. Ten milliseconds is invisible next to the ~150 ms a
+// request already takes, and cuts modem traffic by orders of magnitude --
+// which matters because a single blocked AT call is the one thing that can
+// approach the watchdog period.
+constexpr uint32_t HTTP_ACCEPT_POLL_MS = 10;
 
 // Request-ID constraints.
 constexpr size_t   REQUEST_ID_MAX_LEN = 64;

@@ -40,6 +40,7 @@ class HttpServer {
   WiFiClient client_;
   bool       clientActive_ = false;
   uint32_t   clientStartedAt_ = 0;
+  uint32_t   lastAcceptPollAt_ = 0;
   bool       started_ = false;
 
   RequestParser parser_;

@@ -113,6 +113,14 @@ void HttpServer::acceptNew(uint32_t now) {
   if (clientActive_ || !started_) {
     return;
   }
+  // Rate-limited: see HTTP_ACCEPT_POLL_MS. Each call below is an AT exchange
+  // with the Wi-Fi co-processor, not a cheap local check.
+  if (lastAcceptPollAt_ != 0 &&
+      static_cast<uint32_t>(now - lastAcceptPollAt_) < HTTP_ACCEPT_POLL_MS) {
+    return;
+  }
+  lastAcceptPollAt_ = now;
+
   WiFiClient incoming = server_.available();
   if (!incoming) {
     return;
