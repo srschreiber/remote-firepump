@@ -508,8 +508,17 @@ CommandResult PumpController::handleCommand(CommandType type,
   out.duplicate = false;
 
   const CommandRecord* prior = findRecord(type, requestId);
-  if (prior != nullptr) {
-    // Same request ID and same command: do not execute again.
+  const bool isDuplicate = (prior != nullptr);
+
+  // Duplicate suppression exists to stop a retried network request from
+  // cranking the engine twice. It deliberately does NOT apply to STOP.
+  //
+  // Failing to execute a stop is dangerous; executing one twice is not -- it
+  // simply re-grounds the ignition-kill circuit. Suppressing a replayed STOP
+  // would mean a stale retransmission arriving after a later START could be
+  // silently swallowed while the engine is cranking. STOP therefore always
+  // runs, and is only *labelled* as a duplicate in the response.
+  if (isDuplicate && type != CommandType::STOP) {
     Serial.print(F("[CMD] duplicate ignored: "));
     Serial.println(toString(type));
     out.accepted = prior->accepted;
@@ -519,6 +528,7 @@ CommandResult PumpController::handleCommand(CommandType type,
     out.cooldownRemainingMs = cooldownRemainingMs(now);
     return out;
   }
+  out.duplicate = isDuplicate;
 
   Serial.print(F("[CMD] "));
   Serial.print(toString(type));
@@ -608,7 +618,11 @@ CommandResult PumpController::handleCommand(CommandType type,
   out.state = state_;
   out.cooldownRemainingMs = cooldownRemainingMs(now);
 
-  recordCommand(type, requestId, out.accepted, out.httpStatus);
+  // A re-executed STOP must not consume another ring slot, or a single
+  // retried ID could evict the whole idempotency history.
+  if (!isDuplicate) {
+    recordCommand(type, requestId, out.accepted, out.httpStatus);
+  }
   rememberLastCommand(type, requestId, out.accepted);
 
   Serial.print(F("[CMD] result accepted="));
