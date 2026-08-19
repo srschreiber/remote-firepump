@@ -27,10 +27,12 @@ sources=(
   "$here/test_valve_water.cpp"
   "$here/test_event_log.cpp"
   "$here/test_danger_override.cpp"
+  "$here/test_tank_level.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"
   "$fw/event_log.cpp"
+  "$fw/tank_level.cpp"
 )
 
 # NOTE: -Wuseless-cast is deliberately NOT enabled. The rollover-safe idiom
@@ -70,7 +72,8 @@ for polarity in true false; do
     echo "=== building host tests ($name) ==="
     "$CXX" "${common[@]}" "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" \
            "-DENABLE_MAINTENANCE_API=$maint" \
-           "-DREQUIRE_WATER_INTERLOCK=$water" "${sources[@]}" -o "$exe"
+           "-DREQUIRE_WATER_INTERLOCK=$water" \
+           "-DENABLE_TANK_LEVEL=1" "${sources[@]}" -o "$exe"
 
     echo "=== running host tests ($name) ==="
     if ! "$exe" "$@"; then
@@ -79,6 +82,20 @@ for polarity in true false; do
     done
   done
 done
+
+# The tank sensor is DEFAULT OFF (no hardware fitted yet). The matrix above
+# forces it on so its 12 tests actually assert instead of returning early --
+# the same trap the water-interlock tests fell into. This extra build proves
+# the compiled-out path still builds and reports itself as absent.
+echo
+echo "=== building host tests (tank-compiled-out) ==="
+"$CXX" "${common[@]}" -DRELAY_ACTIVE_LOW_OVERRIDE=true \
+       -DENABLE_MAINTENANCE_API=1 -DREQUIRE_WATER_INTERLOCK=0 \
+       -DENABLE_TANK_LEVEL=0 "${sources[@]}" -o "$build/tests_tank-off"
+echo "=== running host tests (tank-compiled-out) ==="
+if ! "$build/tests_tank-off" "$@"; then
+  failed=1
+fi
 
 echo
 if [ "$failed" -ne 0 ]; then

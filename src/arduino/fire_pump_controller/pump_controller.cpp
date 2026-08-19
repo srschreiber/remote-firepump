@@ -221,11 +221,15 @@ void PumpController::setStarterRelay(bool active) {
       enterFault(FaultCode::STARTER_KILL_CONFLICT);
       return;
     }
-    // Hard interlock: never crank unless priming is complete. "Complete"
-    // means the valve is open AND has been open for the full prime dwell --
-    // an open valve alone does not mean the pump is primed.
+    // Hard interlock: never crank unless the prime PRECONDITION is met --
+    // the valve commanded open, and open for the full dwell.
+    //
+    // Note what this is not. With no water sensor fitted, nothing here knows
+    // whether water actually reached the pump. It knows the valve was
+    // commanded open and that time passed. A stuck valve, a blown valve fuse,
+    // a severed lead or a dry source all satisfy this check.
     if (!primeComplete()) {
-      Serial.println(F("[SAFETY] refused starter: not primed"));
+      Serial.println(F("[SAFETY] refused starter: intake not open for the dwell"));
       enterFault(FaultCode::VALVE_CLOSED_WHILE_RUNNING);
       return;
     }

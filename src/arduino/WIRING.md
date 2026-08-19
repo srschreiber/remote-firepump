@@ -67,3 +67,34 @@ status               show pin states
 
 Requires `ENABLE_SERIAL_CONSOLE 1`. **Set it back to 0 before the controller
 goes on the pump** — a stray keystroke cranks a live engine.
+
+## A0 — tank level sensor (optional, diagnostic only)
+
+DATAQ 2000424-5 submersible level sensor, 0–5 m, ratiometric 0.5–4.5 V.
+**No relay channel** — it is an input.
+
+| Sensor | Goes to |
+| ------ | ------- |
+| red    | Arduino **5V** |
+| black  | Arduino **GND** |
+| yellow | Arduino **A0** |
+
+Plus a **10 kΩ resistor from A0 to GND**. Without it a severed signal wire
+leaves the ADC floating, and a floating input reads ambient noise — which can
+land inside the valid band and pass as a real depth. The pulldown makes a cut
+wire read ~0 V, below the sensor's 0.5 V live zero, so it is reported as a
+fault instead.
+
+```
+0.5 V  = empty (0 m)        < 0.35 V = cut or shorted wire
+4.5 V  = full scale (5 m)   > 4.70 V = miswired / over-range
+```
+
+Ratiometric to the 5 V rail: sensor and ADC reference move together, so a
+sagging rail largely cancels out. This is why a 5 V sensor beats a 12 V one
+here — a 12 V transmitter browns out while the starter is cranking and reports
+a plausible but wrong depth in the one phase worth watching.
+
+**This gates nothing.** It cannot refuse a start or stop a running engine. Set
+`ENABLE_TANK_LEVEL 1` in `config.h` once fitted, and set `TANK_AREA_MM2` to the
+tank's cross-section or the flow rate stays 0.

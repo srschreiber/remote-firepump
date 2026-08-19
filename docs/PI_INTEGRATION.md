@@ -286,10 +286,19 @@ UNKNOWN ─reset-idle─▶ IDLE ─start─▶ PRIMING ─▶ CHOKING ─▶ CR
                                         FAULT ◀── invariant violated
 ```
 
+
 Two ordering rules the whole design turns on, both enforced on the device:
 
-1. **The engine is never cranked before the pump is confirmed primed** —
-   intake open for the full `valve_prime_ms` dwell *and* `water_ok`.
+1. **The engine is never cranked before the intake prime precondition is met**
+   — the valve commanded open for the full `valve_prime_ms` dwell, and
+   `water_ok` where a sensor is fitted.
+
+   Read that literally. With no water sensor (`water_sensor_fitted: false`,
+   which is this install) it proves only that the valve was *told* to open
+   and that time passed. It is not evidence that water reached the pump — a
+   stuck valve, a blown valve fuse, a severed lead or a dry source all
+   satisfy it. **Never render this as "primed" or "water confirmed".** The
+   camera and the operator are the only things that know water is moving.
 2. **The intake is never shut while the engine may be running** — `STOP`
    grounds the kill, holds, then waits `valve_close_delay_ms` before closing.
 

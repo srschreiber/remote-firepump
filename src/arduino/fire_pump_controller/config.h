@@ -251,6 +251,117 @@ static_assert(!INTAKE_VALVE_ENABLED || WATER_INTERLOCK_REQUIRED ||
 
 
 // ---------------------------------------------------------------------------
+// Tank level sensor (A0) -- DIAGNOSTIC ONLY
+// ---------------------------------------------------------------------------
+//
+// DATAQ 2000424-5 submersible hydrostatic level sensor in the supply tank.
+// Ratiometric 0.5-4.5 V output on a 5 V supply, wired straight to A0 -- no
+// relay channel, no converter board.
+//
+//   red    -> Arduino 5V
+//   black  -> Arduino GND
+//   yellow -> A0, with a 10k pulldown to GND (see below)
+//
+// Ratiometric matters: the sensor output and the ADC reference are the same
+// 5 V rail, so a sagging rail moves both together and the error cancels. It
+// is why a 5 V sensor is better here than a 12 V one, which would brown out
+// during cranking and report a plausible-but-wrong depth in the one phase
+// worth watching.
+//
+// This gates NOTHING. No interlock consults it; it cannot refuse a start or
+// stop a running engine. See tank_level.h.
+//
+// DEFAULT 0: no sensor is fitted on this install yet. Absent hardware is not
+// a fault and not a blocker -- with this at 0 the module compiles out
+// entirely, status reports tank.fitted false, and the web page simply shows
+// no tank telemetry. Set to 1 once the sensor is wired.
+//
+// The firmware cannot tell "no sensor installed" from "sensor installed,
+// cable cut": both read ~0 V. That is what this flag is for -- the installer
+// asserting the hardware exists, so 0 V can then be reported honestly as a
+// broken wire rather than as normal.
+#ifndef ENABLE_TANK_LEVEL
+#define ENABLE_TANK_LEVEL 0
+#endif
+
+constexpr bool TANK_LEVEL_ENABLED = (ENABLE_TANK_LEVEL != 0);
+
+constexpr uint8_t PIN_TANK_LEVEL = A0;
+
+// Sensor transfer function. Expressed as volts at the ADC rather than as the
+// sensor's native units, so a different sensor is a change of these four
+// numbers and nothing else.
+//
+// DATAQ 2000424-5: 0.5 V = 0 m, 4.5 V = 5 m.
+constexpr float TANK_V_ZERO       = 0.50f;
+constexpr float TANK_V_FULL_SCALE = 4.50f;
+constexpr float TANK_RANGE_MM     = 5000.0f;
+
+// The UNO R4's ADC reference is the 5 V rail and the RA4M1 samples at 14
+// bits. A 0.5-4.5 V swing uses 80% of that range: about 0.4 mm of water per
+// count, far finer than the sensor's own 0.5% accuracy.
+constexpr uint8_t  TANK_ADC_BITS       = 14;
+constexpr float    TANK_ADC_MAX_COUNTS = 16383.0f;   // 2^14 - 1
+constexpr float    TANK_ADC_REF_MV     = 5000.0f;
+
+// Validity window, and the reason for the 10k pulldown on A0.
+//
+// The sensor's live zero is 0.5 V: a healthy sensor NEVER outputs below it,
+// so anything under TANK_V_MIN_VALID means a cut or shorted signal wire.
+// That check only works if a severed wire actually reads low -- an open ADC
+// input floats and picks up whatever noise is nearby, which can easily land
+// inside the valid band and masquerade as a real depth. The pulldown makes a
+// broken wire read ~0 V, unambiguously.
+constexpr float TANK_V_MIN_VALID = 0.35f;
+constexpr float TANK_V_MAX_VALID = 4.70f;
+
+// Tank cross-sectional area, square millimetres. Needed to turn a level slope
+// into a flow rate.
+//
+// MUST BE SET FOR THIS INSTALL. While it is 0 the level and the trend are
+// still reported honestly and flow_lpm simply stays 0, which is better than
+// inventing a number from a guessed tank size.
+//
+//   cylindrical tank:  area = PI * radius_mm^2
+//   rectangular tank:  area = length_mm * width_mm
+//
+// e.g. a 2 m diameter round tank: PI * 1000^2 = 3141593.0f
+constexpr float TANK_AREA_MM2 = 0.0f;
+
+// Sampling. 32 samples at 500 ms is a 16 second regression window: long
+// enough to average out the surface movement a running pump causes, short
+// enough that the displayed flow tracks reality.
+constexpr uint32_t TANK_SAMPLE_INTERVAL_MS = 500;
+constexpr uint8_t  TANK_SAMPLE_COUNT       = 32;
+
+// The residual variance divides by (n - 2), so a trend needs more than two
+// points before it is even defined. Eight is the practical floor.
+constexpr uint8_t TANK_MIN_SAMPLES_FOR_TREND = 8;
+
+// Slope significance. The slope must clear BOTH:
+//
+//   * this many standard errors, so noise alone cannot manufacture a trend
+//     (3.0 is about 99% confidence at this sample count);
+//   * this physical floor, because a 0.5% sensor over 5 m cannot honestly
+//     resolve a fraction of a millimetre per second however clean the
+//     statistics happen to look.
+constexpr float TANK_TREND_T_STATISTIC  = 3.0f;
+constexpr float TANK_MIN_SLOPE_MM_PER_S = 0.20f;
+
+// Guard on the regression denominator, which is zero when every sample shares
+// a timestamp. Compared with `!(sxx > TANK_MIN_SXX)` so a NaN also fails.
+constexpr float TANK_MIN_SXX = 1e-6f;
+
+static_assert(TANK_SAMPLE_COUNT >= TANK_MIN_SAMPLES_FOR_TREND,
+              "the sample window cannot hold enough points for a trend");
+static_assert(TANK_MIN_SAMPLES_FOR_TREND > 2,
+              "residual variance divides by (n - 2)");
+static_assert(TANK_V_FULL_SCALE > TANK_V_ZERO,
+              "the sensor voltage span must be positive");
+static_assert(TANK_V_MIN_VALID < TANK_V_ZERO,
+              "the fault threshold must sit below the sensor live zero");
+
+// ---------------------------------------------------------------------------
 // DANGER_OVERRIDE
 // ---------------------------------------------------------------------------
 //

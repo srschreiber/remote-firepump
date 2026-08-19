@@ -8,6 +8,7 @@ namespace fake {
 
 int      pinLevel[kMaxPins];
 int      pinModeOf[kMaxPins];
+int      analogCounts[kMaxPins];
 uint32_t nowMs = 0;
 std::vector<Event> events;
 std::string serialLog;
@@ -19,6 +20,9 @@ void reset() {
   for (int i = 0; i < kMaxPins; ++i) {
     pinLevel[i] = -1;
     pinModeOf[i] = -1;
+    // 0 counts = 0 V = an open 4-20 mA loop, which the level sensor treats
+    // as a broken wire. Tests that want a reading set it explicitly.
+    analogCounts[i] = 0;
   }
   nowMs = 0;
   events.clear();
@@ -90,3 +94,16 @@ int digitalRead(uint8_t pin) {
 uint32_t millis() { return fake::nowMs; }
 
 void delay(uint32_t ms) { fake::nowMs += ms; }
+
+
+int analogRead(uint8_t pin) {
+  if (pin >= fake::kMaxPins) {
+    return 0;
+  }
+  return fake::analogCounts[pin];
+}
+
+void analogReadResolution(int) {
+  // The real core changes the ADC width here. Tests set fake::analogCounts
+  // directly in whatever width they declare, so this is a no-op.
+}

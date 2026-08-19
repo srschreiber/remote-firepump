@@ -2,6 +2,8 @@
 
 #include "api_handler.h"
 
+#include "tank_level.h"
+
 #include <string.h>
 
 namespace {
@@ -45,6 +47,14 @@ void makeStatusView(StatusView& v,
   v.valve   = pump.valveActive();
   v.valveEnabled = INTAKE_VALVE_ENABLED;
   v.waterOk = pump.waterOk();
+  const TankLevel& tank = tankLevel();
+  v.tankStatus    = toString(tank.status());
+  v.tankTrend     = toString(tank.trend());
+  v.tankLevelMm   = tank.levelMm();
+  v.tankVolumeL   = tank.volumeLitres();
+  v.tankFlowLpm   = tank.flowLpm();
+  v.tankVolts     = tank.volts();
+
   v.overrideActive = pump.overrideActive();
   v.overrideCount = pump.overrideCount();
 

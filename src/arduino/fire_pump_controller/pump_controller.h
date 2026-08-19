@@ -187,9 +187,13 @@ class PumpController {
   // means the pump is running dry.
   bool engineWasStarted() const;
 
-  // True only when the valve is open AND has been open for the full
-  // VALVE_PRIME_MS dwell. An open valve on its own is not a primed pump, so
-  // this -- not valveActive() -- is what gates the starter.
+  // True when the valve is COMMANDED open and has been for the full
+  // VALVE_PRIME_MS dwell. This -- not valveActive() -- is what gates the
+  // starter.
+  //
+  // The name is aspirational. Without a water sensor this proves only that
+  // the valve was told to open and that time passed; it is not evidence that
+  // the pump flooded. Never present it to an operator as confirmed water.
   bool primeComplete() const;
 
   // True when no relay timing is pending, so a potentially blocking Wi-Fi

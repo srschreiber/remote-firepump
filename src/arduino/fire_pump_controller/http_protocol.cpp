@@ -2,6 +2,7 @@
 
 #include "http_protocol.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -479,6 +480,37 @@ size_t finish(char* buf, size_t cap, int written) {
 
 }  // namespace
 
+namespace {
+
+// One decimal place, without printf's %f.
+//
+// The Renesas core links newlib-nano, whose printf omits floating point
+// unless -u _printf_float is forced in. Rather than depend on that, and on it
+// staying true across core updates, the two decimals this API needs are
+// formatted with integer arithmetic. A silently empty number in a status
+// document would be worse than an ugly one.
+const char* fmt1(char* buf, size_t cap, float v) {
+  if (cap < 8) {
+    return "0.0";
+  }
+  // Non-finite cannot reach the wire: it would produce invalid JSON.
+  if (isnan(v) || isinf(v)) {
+    snprintf(buf, cap, "0.0");
+    return buf;
+  }
+  bool neg = v < 0.0f;
+  if (neg) v = -v;
+  if (v > 99999.0f) v = 99999.0f;   // keep the field bounded
+
+  const uint32_t scaled = static_cast<uint32_t>(v * 10.0f + 0.5f);
+  snprintf(buf, cap, "%s%lu.%lu", neg ? "-" : "",
+           static_cast<unsigned long>(scaled / 10u),
+           static_cast<unsigned long>(scaled % 10u));
+  return buf;
+}
+
+}  // namespace
+
 size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
   if (buf == nullptr || cap == 0) {
     return 0;
@@ -512,6 +544,10 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
     }
   }
 
+  char tankVolBuf[12];
+  char tankFlowBuf[12];
+  char tankMaBuf[12];
+
   const int written = snprintf(
       buf, cap,
       "{"
@@ -524,6 +560,9 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       "\"running_confirmed\":%s,"
       "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"valve\":%s},"
       "\"water_ok\":%s,\"water_sensor_fitted\":%s,"
+      "\"kill_relay_fail_safe_nc\":%s,"
+      "\"tank\":{\"fitted\":%s,\"status\":\"%s\",\"trend\":\"%s\","
+      "\"level_mm\":%ld,\"volume_l\":%s,\"flow_lpm\":%s,\"volts\":%s},"
       "\"intake_valve_enabled\":%s,"
       "\"danger_override_active\":%s,\"danger_override_count\":%lu,"
       "\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi_dbm\":%ld},"
@@ -542,6 +581,12 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       v.engineStatus, jsonBool(v.runningConfirmed),
       jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.valve),
       jsonBool(v.waterOk), jsonBool(v.waterSensorFitted),
+      jsonBool(v.killFailSafeNC),
+      jsonBool(v.tankFitted), v.tankStatus, v.tankTrend,
+      static_cast<long>(v.tankLevelMm),
+      fmt1(tankVolBuf, sizeof(tankVolBuf), v.tankVolumeL),
+      fmt1(tankFlowBuf, sizeof(tankFlowBuf), v.tankFlowLpm),
+      fmt1(tankMaBuf, sizeof(tankMaBuf), v.tankVolts),
       jsonBool(v.valveEnabled),
       jsonBool(v.overrideActive),
       static_cast<unsigned long>(v.overrideCount),

@@ -26,7 +26,7 @@ constexpr size_t HTTP_SECRET_MAX = 128;
 // Enough for the largest status document with generous slack. The test
 // `status_json_fits_the_response_buffer_at_maximum_size` fails if a new field
 // ever pushes the worst case past this.
-constexpr size_t HTTP_BODY_MAX   = 896;
+constexpr size_t HTTP_BODY_MAX   = 1280;
 // Response status line + fixed headers.
 constexpr size_t HTTP_HEAD_MAX   = 192;
 
@@ -191,6 +191,22 @@ struct StatusView {
   bool valve = false;   // K4: true means the NC intake valve is OPEN
   bool valveEnabled = INTAKE_VALVE_ENABLED;
   bool waterOk = false; // debounced water-available interlock
+
+  // K3 wiring. When true the relay is ENERGISED to permit running, so the
+  // logical "kill asserted" is the inverse of the coil state. A UI that shows
+  // which relays are drawing current needs this to render K3 correctly.
+  bool killFailSafeNC = KILL_RELAY_FAIL_SAFE_NC;
+
+  // Tank level. Diagnostic only -- see tank_level.h. flowLpm is a MAGNITUDE;
+  // tankTrend carries the direction, so a refilling tank never appears as a
+  // negative flow.
+  bool        tankFitted = TANK_LEVEL_ENABLED;
+  const char* tankStatus = "WARMING_UP";
+  const char* tankTrend  = "UNKNOWN";
+  int32_t     tankLevelMm = 0;
+  float       tankVolumeL = 0.0f;
+  float       tankFlowLpm = 0.0f;
+  float       tankVolts = 0.0f;
 
   // Whether a water sensor exists at all. Without this the client cannot tell
   // "no water" from "no sensor": both leave waterOk false on older builds.

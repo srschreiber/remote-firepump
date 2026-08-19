@@ -24,6 +24,16 @@
 #define OUTPUT       0x1
 #define INPUT_PULLUP 0x2
 
+// Analog pin numbers. The real core maps A0.. to board-specific indices; the
+// only property the firmware depends on is that they are distinct from the
+// digital pins it drives, so 14+ mirrors the classic Arduino numbering.
+#define A0 14
+#define A1 15
+#define A2 16
+#define A3 17
+#define A4 18
+#define A5 19
+
 // On real hardware F() moves the literal to flash. On the host it is identity.
 #define F(x) (x)
 
@@ -43,6 +53,10 @@ struct Event {
   uint32_t  at;       // value of fake::nowMs when it happened
   uint64_t  seq;      // strictly increasing, for order assertions
 };
+
+// Raw ADC counts a test wants analogRead() to return for a pin. Defaults to
+// 0, which for a 4-20 mA loop reads as an open circuit -- the safe default.
+extern int      analogCounts[kMaxPins];
 
 extern int      pinLevel[kMaxPins];   // -1 until first digitalWrite
 extern int      pinModeOf[kMaxPins];  // -1 until first pinMode
@@ -66,6 +80,8 @@ size_t lastWriteIndex(uint8_t pin, uint8_t level);
 void     pinMode(uint8_t pin, uint8_t mode);
 void     digitalWrite(uint8_t pin, uint8_t value);
 int      digitalRead(uint8_t pin);
+int      analogRead(uint8_t pin);
+void     analogReadResolution(int bits);
 uint32_t millis();
 void     delay(uint32_t ms);
 

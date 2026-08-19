@@ -28,6 +28,7 @@
 #include "net_manager.h"
 #include "pump_controller.h"
 #include "serial_console.h"
+#include "tank_level.h"
 
 #if ENABLE_WATCHDOG
 #include <WDT.h>
@@ -40,6 +41,7 @@ NetManager     g_net;
 HttpServer     g_http;
 StatusMatrix   g_matrix;
 SerialConsole  g_console;
+
 
 #if ENABLE_WATCHDOG
 bool     g_watchdogArmed = false;
@@ -139,6 +141,7 @@ void setup() {
 
   g_matrix.begin();
   g_console.begin();
+  tankLevel().begin(millis());
 
   g_net.begin(millis());
   g_http.begin();
@@ -203,6 +206,10 @@ void loop() {
   //    starter, choke or kill timing window. A running lamp test counts as
   //    busy, so the radio is left alone while relays are being pulsed.
   g_net.tick(now, g_pump.isQuiescent() && !g_console.lampTestActive());
+
+  // Diagnostic only, and deliberately after every safety-critical step: one
+  // analogRead per sample interval, gating nothing.
+  tankLevel().tick(now);
 
   // Cosmetic status display. Last, so it can never delay anything that
   // matters, and rate-limited internally to a frame every ~100 ms.
