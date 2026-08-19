@@ -42,7 +42,9 @@ void makeStatusView(StatusView& v,
   v.starter = pump.starterActive();
   v.choke   = pump.chokeActive();
   v.kill    = pump.killActive();
-  v.spare   = pump.spareActive();
+  v.valve   = pump.valveActive();
+  v.valveEnabled = INTAKE_VALVE_ENABLED;
+  v.waterOk = pump.waterOk();
 
   v.wifiConnected = net.connected;
   v.ip = net.ip;

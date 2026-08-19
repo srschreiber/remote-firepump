@@ -30,6 +30,17 @@ std::string sendWithHeaders(PumpController& p, const char* method,
   return doRequest(p, raw, status, fake::nowMs);
 }
 
+// Satisfies the crank preconditions through the maintenance API, the same way
+// the real start sequence does: intake open, prime dwell elapsed, kill released.
+void primeAndPermitCranking(PumpController& p) {
+  uint16_t st = 0;
+  if (INTAKE_VALVE_ENABLED) {
+    sendWithHeaders(p, "POST", "/v1/maintenance/valve/on", nullptr, st, "pre-v");
+    advanceBy(p, VALVE_PRIME_MS);
+  }
+  sendWithHeaders(p, "POST", "/v1/maintenance/kill/off", nullptr, st, "pre-k");
+}
+
 uint32_t starterOnMs() {
   bool on = false;
   uint32_t onAt = 0;
@@ -138,7 +149,10 @@ TEST(a_crank_override_changes_the_actual_starter_engagement_time) {
   const std::string body = sendWithHeaders(
       p, "POST", "/v1/start", "X-Crank-Ms: 3500\r\n", status, "ov-crank");
   CHECK_EQ(status, 202);
-  CHECK_CONTAINS(body, "\"state\":\"CHOKING\"");
+  // START now primes first; skip the dwell to reach the choke phase.
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
+  CHECK_STREQ(toString(p.state()), "CHOKING");
+  (void)body;
 
   // Default choke prep still applies.
   advanceBy(p, CHOKE_PREP_MS);
@@ -161,6 +175,7 @@ TEST(all_three_timing_overrides_take_effect_together) {
                   "X-Choke-Ms: 200\r\nX-Crank-Ms: 900\r\nX-Unchoke-Ms: 100\r\n",
                   status, "ov-all");
   CHECK_EQ(status, 202);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
 
   advanceBy(p, 199);
   CHECK_STREQ(toString(p.state()), "CHOKING");
@@ -227,6 +242,7 @@ TEST(exactly_the_hard_ceiling_is_accepted) {
   uint16_t status = 0;
   sendWithHeaders(p, "POST", "/v1/start", header, status, "ov-max");
   CHECK_EQ(status, 202);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
 
   advanceBy(p, CHOKE_PREP_MS + MAX_CRANK_MS + UNCHOKE_DELAY_MS);
   CHECK_EQ(starterOnMs(), MAX_CRANK_MS);
@@ -306,6 +322,7 @@ TEST(a_zero_crank_override_never_engages_the_starter) {
   sendWithHeaders(p, "POST", "/v1/start", "X-Crank-Ms: 0\r\n", status, "ov-zero");
   CHECK_EQ(status, 202);
 
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
   advanceBy(p, CHOKE_PREP_MS + UNCHOKE_DELAY_MS + 10);
   CHECK_STREQ(toString(p.state()), "RUNNING_ASSUMED");
   // The starter may flick on and straight back off within one tick; what
@@ -424,7 +441,7 @@ TEST(maintenance_endpoints_still_require_authentication) {
     raw += " HTTP/1.1\r\nX-Pump-Secret: wrong\r\nX-Request-ID: m1\r\n\r\n";
     doRequest(p, raw, status, fake::nowMs);
     CHECK_MSG(status == 401, path);
-    CHECK_MSG(!p.chokeActive() && !p.starterActive() && !p.killActive(), path);
+    CHECK_MSG(!p.chokeActive() && !p.starterActive() && !p.valveActive(), path);
   }
 }
 
@@ -454,6 +471,7 @@ TEST(maintenance_relay_control_works_when_enabled) {
   CHECK(!p.chokeActive());
   CHECK_EQ(fake::pinLevel[PIN_RELAY_CHOKE], inactiveLevel());
 
+  primeAndPermitCranking(p);
   sendWithHeaders(p, "POST", "/v1/maintenance/starter/on", nullptr, status, "m-3");
   CHECK_EQ(status, 202);
   CHECK(p.starterActive());
@@ -470,7 +488,7 @@ TEST(maintenance_relay_control_works_when_enabled) {
   CHECK_EQ(status, 202);
   CHECK(!p.killActive());
 
-  checkSpareNeverActive("maintenance relay control");
+  checkStarterNeverCrankedWithKillAsserted("maintenance relay control");
 }
 
 TEST(maintenance_cannot_energise_the_starter_while_kill_is_grounded) {
@@ -505,6 +523,7 @@ TEST(maintenance_kill_on_releases_a_manually_engaged_starter_first) {
   driveToState(p, PumpState::IDLE);
 
   uint16_t status = 0;
+  primeAndPermitCranking(p);
   sendWithHeaders(p, "POST", "/v1/maintenance/starter/on", nullptr, status, "o-1");
   CHECK(p.starterActive());
 
@@ -519,10 +538,11 @@ TEST(maintenance_kill_on_releases_a_manually_engaged_starter_first) {
     const fake::Event& e = fake::events[i];
     if (e.kind != fake::EventKind::DIGITAL_WRITE) continue;
     if (e.pin == PIN_RELAY_STARTER && e.value == inactiveLevel() && starterOff == SIZE_MAX) starterOff = i;
-    if (e.pin == PIN_RELAY_KILL && e.value == activeLevel() && killOn == SIZE_MAX) killOn = i;
+    // Asserting the kill means DE-energising K3, so its NC contact closes.
+    if (e.pin == PIN_RELAY_KILL && e.value == killPinLevelFor(true) && killOn == SIZE_MAX) killOn = i;
   }
   CHECK(starterOff != SIZE_MAX && killOn != SIZE_MAX);
-  CHECK_MSG(starterOff < killOn, "kill closed before the starter opened");
+  CHECK_MSG(starterOff < killOn, "the ignition was grounded before the starter opened");
 }
 
 TEST(a_manually_engaged_starter_is_still_force_released_at_max_crank) {
@@ -533,6 +553,7 @@ TEST(a_manually_engaged_starter_is_still_force_released_at_max_crank) {
   driveToState(p, PumpState::IDLE);
 
   uint16_t status = 0;
+  primeAndPermitCranking(p);
   sendWithHeaders(p, "POST", "/v1/maintenance/starter/on", nullptr, status, "t-1");
   CHECK(p.starterActive());
 
@@ -616,6 +637,7 @@ TEST(stop_still_overrides_manually_energised_relays) {
   driveToState(p, PumpState::IDLE);
 
   uint16_t status = 0;
+  primeAndPermitCranking(p);
   sendWithHeaders(p, "POST", "/v1/maintenance/starter/on", nullptr, status, "x-1");
   sendWithHeaders(p, "POST", "/v1/maintenance/choke/on", nullptr, status, "x-2");
   CHECK(p.starterActive());

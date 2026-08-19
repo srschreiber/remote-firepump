@@ -24,6 +24,7 @@ sources=(
   "$here/test_api_handler.cpp"
   "$here/test_invariants.cpp"
   "$here/test_extensions.cpp"
+  "$here/test_valve_water.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"

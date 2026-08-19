@@ -18,11 +18,13 @@
 enum class PumpState : uint8_t {
   UNKNOWN = 0,
   IDLE,
+  PRIMING,          // valve open, priming before the choke/crank sequence
   CHOKING,
   CRANKING,
   UNCHOKING,
   RUNNING_ASSUMED,
   STOPPING,
+  VALVE_CLOSING,    // engine killed; letting it stop before shutting the valve
   RETRY_WAIT,
   FAULT,
 };
@@ -42,6 +44,8 @@ enum class CommandType : uint8_t {
   MAINT_STARTER_OFF,
   MAINT_KILL_ON,
   MAINT_KILL_OFF,
+  MAINT_VALVE_ON,
+  MAINT_VALVE_OFF,
 };
 
 // Returns true for the six maintenance command types.
@@ -76,7 +80,8 @@ enum class FaultCode : uint8_t {
   STARTER_KILL_CONFLICT,  // starter and kill commanded simultaneously
   STARTER_OVERRUN,        // starter active beyond MAX_CRANK_MS
   CHOKE_OVERRUN,          // choke active beyond MAX_CHOKE_MS
-  SPARE_ACTIVE,           // K4 found active; it must never be
+  VALVE_CLOSED_WHILE_RUNNING,  // intake found shut with the engine possibly running
+  WATER_LOST,             // water-available interlock dropped while running
   ILLEGAL_TRANSITION,     // state machine reached an impossible state
 };
 
@@ -146,8 +151,30 @@ class PumpController {
 
   bool starterActive() const { return starterActive_; }
   bool chokeActive() const { return chokeActive_; }
+
+  // True means kill is ASSERTED: the ignition-kill wire is grounded and the
+  // engine is inhibited. With the fail-safe NC wiring this corresponds to K3
+  // being DE-energised, which is also its resting and power-loss state.
   bool killActive() const { return killActive_; }
-  bool spareActive() const { return spareActive_; }
+
+  // Debounced state of the water-available interlock.
+  bool waterOk() const { return waterOk_; }
+
+  // K4. True means the normally-closed priming valve is energised, i.e. OPEN.
+  bool valveActive() const { return valveActive_; }
+
+  // States in which the engine could plausibly be turning, so the valve must
+  // not be shut (closing it against a running pump deadheads it).
+  bool engineMayBeRunning() const;
+
+  // Narrower: only states reachable by actually cranking. A shut intake here
+  // means the pump is running dry.
+  bool engineWasStarted() const;
+
+  // True only when the valve is open AND has been open for the full
+  // VALVE_PRIME_MS dwell. An open valve on its own is not a primed pump, so
+  // this -- not valveActive() -- is what gates the starter.
+  bool primeComplete() const;
 
   // True when no relay timing is pending, so a potentially blocking Wi-Fi
   // operation may be performed without disturbing a safety-critical sequence.
@@ -173,12 +200,18 @@ class PumpController {
   static void setRelayOutput(uint8_t pin, bool active);
   static void initRelayPin(uint8_t pin);
 
+  // Applies the K3 fail-safe wiring inversion. The only place it happens.
+  static void driveKillOutput(bool killAsserted);
+
   void setStarterRelay(bool active);
   void setChokeRelay(bool active);
   void setKillRelay(bool active);
-  void setSpareRelay(bool active);
 
-  void allRelaysInactive();
+  // active == true opens the normally-closed valve. Closing is refused while
+  // the engine may be running; see engineMayBeRunning().
+  void setValveRelay(bool active);
+
+  void toSafeState();
 
   // --- internals -----------------------------------------------------------
 
@@ -193,6 +226,9 @@ class PumpController {
   bool startPermitted(uint32_t now) const;
   bool maintenancePermitted() const;
   bool applyMaintenance(CommandType type);
+
+  void updateWaterInterlock(uint32_t now);
+  bool waterStartupGraceActive(uint32_t now) const;
 
   // Idempotency ring buffer.
   struct CommandRecord {
@@ -219,10 +255,16 @@ class PumpController {
   bool     starterActive_ = false;
   bool     chokeActive_   = false;
   bool     killActive_    = false;
-  bool     spareActive_   = false;
+  bool     valveActive_   = false;
 
   uint32_t starterOnAt_   = 0;
   uint32_t chokeOnAt_     = 0;
+  uint32_t valveOpenedAt_ = 0;
+
+  // Water-available interlock, debounced.
+  bool     waterOk_          = false;
+  bool     waterRawLast_     = false;
+  uint32_t waterStableSince_ = 0;
 
   // Timings governing the current start sequence.
   StartTimings timings_;

@@ -39,11 +39,12 @@ void SerialConsole::printHelp() const {
   Serial.println(F("commands:"));
   Serial.println(F("  help              this list"));
   Serial.println(F("  status            state, relays, wifi, fault"));
-  Serial.println(F("  test              LAMP TEST: pulse K1, K2, K3 in turn"));
+  Serial.println(F("  test              LAMP TEST: pulse K2, K4, K3, K1 in order"));
   Serial.println(F("  scan              list visible 2.4 GHz networks"));
   Serial.println(F("  choke   on|off    drive K2 (D3/IN2)"));
   Serial.println(F("  starter on|off    drive K1 (D2/IN1)"));
   Serial.println(F("  kill    on|off    drive K3 (D4/IN3)"));
+  Serial.println(F("  valve   on|off    drive K4 (D5/IN4) -- OPEN|shut"));
   Serial.println(F("  start             run the full start sequence"));
   Serial.println(F("  stop              stop now, from any state"));
   Serial.println(F("  failed            report that the start did not work"));
@@ -66,8 +67,8 @@ void SerialConsole::printStatus(const PumpController& pump,
   Serial.print(pump.chokeActive() ? "ON " : "off");
   Serial.print(F(" kill="));
   Serial.print(pump.killActive() ? "ON " : "off");
-  Serial.print(F(" spare="));
-  Serial.println(pump.spareActive() ? "ON " : "off");
+  Serial.print(F(" valve="));
+  Serial.println(pump.valveActive() ? "OPEN " : "shut");
 
   Serial.print(F("pin levels (active="));
   Serial.print(RELAY_ACTIVE_LOW ? F("LOW") : F("HIGH"));
@@ -78,7 +79,7 @@ void SerialConsole::printStatus(const PumpController& pump,
   Serial.print(F(" D4="));
   Serial.print(digitalRead(PIN_RELAY_KILL) ? F("HIGH") : F("LOW"));
   Serial.print(F(" D5="));
-  Serial.println(digitalRead(PIN_RELAY_SPARE) ? F("HIGH") : F("LOW"));
+  Serial.println(digitalRead(PIN_RELAY_VALVE) ? F("HIGH") : F("LOW"));
 
   Serial.print(F("cooldown_ms="));
   Serial.print(pump.cooldownRemainingMs(now));
@@ -135,8 +136,8 @@ void SerialConsole::startLampTest(uint32_t now, PumpController& pump) {
     return;
   }
 
-  Serial.println(F("lamp test: K2 choke -> K1 starter -> K3 kill"));
-  Serial.println(F("watch IN2, IN1, IN3 in that order; 'stop' aborts"));
+  Serial.println(F("lamp test: K2 choke -> K4 intake -> prime -> K3 run-en -> K1 starter"));
+  Serial.println(F("watch IN2, IN4, IN3, IN1 in that order; -stop- aborts"));
   lamp_ = LampPhase::CHOKE_ON;
   lampPhaseAt_ = now;
   // Fire the first pulse here rather than from advanceLampTest(). Driving it
@@ -167,6 +168,7 @@ void SerialConsole::advanceLampTest(uint32_t now, PumpController& pump) {
     Serial.println(F("lamp test: aborted (controller left IDLE/UNKNOWN)"));
     pump.handleCommand(CommandType::MAINT_CHOKE_OFF, "", now);
     pump.handleCommand(CommandType::MAINT_STARTER_OFF, "", now);
+    pump.handleCommand(CommandType::MAINT_VALVE_OFF, "", now);
     lamp_ = LampPhase::OFF;
     return;
   }
@@ -186,6 +188,36 @@ void SerialConsole::advanceLampTest(uint32_t now, PumpController& pump) {
 
     case LampPhase::CHOKE_OFF:
       if (gapDone) {
+        if (INTAKE_VALVE_ENABLED) {
+          fireLamp(CommandType::MAINT_VALVE_ON, "K4 intake  (D5/IN4) OPEN", pump, now);
+          lamp_ = LampPhase::VALVE_ON;
+        } else {
+          lamp_ = LampPhase::PRIME_WAIT;
+        }
+        lampPhaseAt_ = now;
+      }
+      break;
+
+    case LampPhase::VALVE_ON:
+      if (pulseDone) {
+        Serial.println(F("  priming... (the starter is interlocked until primed)"));
+        lamp_ = LampPhase::PRIME_WAIT;
+        lampPhaseAt_ = now;
+      }
+      break;
+
+    case LampPhase::PRIME_WAIT:
+      // The starter interlock requires the full prime dwell to have elapsed.
+      if (!INTAKE_VALVE_ENABLED ||
+          static_cast<uint32_t>(now - lampPhaseAt_) >= VALVE_PRIME_MS) {
+        fireLamp(CommandType::MAINT_KILL_OFF, "K3 run-en  (D4/IN3) ENERGISED", pump, now);
+        lamp_ = LampPhase::KILL_RELEASE;
+        lampPhaseAt_ = now;
+      }
+      break;
+
+    case LampPhase::KILL_RELEASE:
+      if (gapDone) {
         fireLamp(CommandType::MAINT_STARTER_ON, "K1 starter (D2/IN1) ON ", pump, now);
         lamp_ = LampPhase::STARTER_ON;
         lampPhaseAt_ = now;
@@ -202,24 +234,28 @@ void SerialConsole::advanceLampTest(uint32_t now, PumpController& pump) {
 
     case LampPhase::STARTER_OFF:
       if (gapDone) {
-        fireLamp(CommandType::MAINT_KILL_ON, "K3 kill    (D4/IN3) ON ", pump, now);
-        lamp_ = LampPhase::KILL_ON;
+        fireLamp(CommandType::MAINT_KILL_ON, "K3 run-en  (D4/IN3) de-energised", pump, now);
+        lamp_ = LampPhase::KILL_ASSERT;
         lampPhaseAt_ = now;
       }
       break;
 
-    case LampPhase::KILL_ON:
-      if (pulseDone) {
-        fireLamp(CommandType::MAINT_KILL_OFF, "K3 kill    (D4/IN3) off", pump, now);
-        lamp_ = LampPhase::KILL_OFF;
-        lampPhaseAt_ = now;
-      }
-      break;
-
-    case LampPhase::KILL_OFF:
+    case LampPhase::KILL_ASSERT:
       if (gapDone) {
-        Serial.println(F("lamp test: complete. K4/D5 was never touched, by design."));
+        if (INTAKE_VALVE_ENABLED) {
+          fireLamp(CommandType::MAINT_VALVE_OFF, "K4 intake  (D5/IN4) shut", pump, now);
+        }
+        lamp_ = LampPhase::VALVE_OFF;
+        lampPhaseAt_ = now;
+      }
+      break;
+
+    case LampPhase::VALVE_OFF:
+      if (gapDone) {
+        Serial.println(F("lamp test: complete."));
         Serial.println(F("If a relay did not click or light, check that wiring."));
+        Serial.println(F("NOTE: K3 is energised to PERMIT running, so its LED is"));
+        Serial.println(F("      lit only during the starter step. That is correct."));
         lamp_ = LampPhase::OFF;
       }
       break;
@@ -313,6 +349,12 @@ void SerialConsole::handleLine(uint32_t now, PumpController& pump,
       runCommand(wantOn ? CommandType::MAINT_STARTER_ON
                         : CommandType::MAINT_STARTER_OFF,
                  "starter", pump, now);
+      return;
+    }
+    if (tokenIs(verb, "valve")) {
+      runCommand(wantOn ? CommandType::MAINT_VALVE_ON
+                        : CommandType::MAINT_VALVE_OFF,
+                 "valve", pump, now);
       return;
     }
     if (tokenIs(verb, "kill")) {

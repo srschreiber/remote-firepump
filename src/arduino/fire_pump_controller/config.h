@@ -11,7 +11,10 @@
 // Identity
 // ---------------------------------------------------------------------------
 
-constexpr char FIRMWARE_VERSION[] = "0.1.0";
+// 0.2.0 assigned K4 to the priming valve. That is a breaking API change:
+// relay_outputs."spare" became relay_outputs."valve", and two states were
+// added (PRIMING, VALVE_CLOSING).
+constexpr char FIRMWARE_VERSION[] = "0.2.0";
 
 // Requested DHCP hostname. This is what the router *may* show in its client
 // list. It does NOT guarantee mDNS / "fire-pump-controller.local" resolution.
@@ -45,28 +48,61 @@ constexpr bool RELAY_ACTIVE_LOW = true;
 //   Arduino GND -> relay GND
 //   D2 -> IN1  K1 starter command
 //   D3 -> IN2  K2 choke command
-//   D4 -> IN3  K3 stop/kill command
-//   D5 -> IN4  K4 spare, permanently inactive
+//   D4 -> IN3  K3 RUN-ENABLE  (wired to the NC contact -- see below)
+//   D5 -> IN4  K4 intake valve command
+//   D6 <- water-available interlock input (switch to GND)
 //
 // D0/D1 are deliberately avoided (RX/TX). D3 and D5 are PWM-capable but are
 // used strictly as plain digital outputs; no analogWrite() anywhere.
 
 constexpr uint8_t PIN_RELAY_STARTER = 2;  // IN1 / K1
 constexpr uint8_t PIN_RELAY_CHOKE   = 3;  // IN2 / K2
-constexpr uint8_t PIN_RELAY_KILL    = 4;  // IN3 / K3
-constexpr uint8_t PIN_RELAY_SPARE   = 5;  // IN4 / K4
+constexpr uint8_t PIN_RELAY_KILL    = 4;  // IN3 / K3 run-enable
+constexpr uint8_t PIN_RELAY_VALVE   = 5;  // IN4 / K4 intake valve
+constexpr uint8_t PIN_WATER_OK      = 6;  // input, water-available interlock
+
+// ---------------------------------------------------------------------------
+// K3 is a FAIL-SAFE RUN-ENABLE relay, not a "kill" relay
+// ---------------------------------------------------------------------------
+//
+// A GX390's magneto ignition is independent of the battery and the electric
+// starter: cutting controller power does NOT stop the engine. Combined with a
+// fail-closed intake valve, a naive "energise K3 to stop" design produces the
+// worst possible outcome on power loss -- valve shuts, engine keeps running,
+// pump runs dry, mechanical seal destroyed.
+//
+// K3 is therefore wired to its NORMALLY CLOSED contact and must be held
+// ENERGISED for the engine to be permitted to run:
+//
+//   K3 COM -> verified Honda ignition-kill wire
+//   K3 NC  -> engine ground
+//   K3 NO  -> unused
+//
+//   relay DE-ENERGISED -> NC closed -> kill wire grounded -> engine CANNOT run
+//   relay ENERGISED    -> NC open   -> kill wire floating -> engine MAY run
+//
+// So controller power loss, a watchdog reset, a blown 5 V rail or a snapped
+// IN3 wire all ground the kill wire and stop the engine. That is the point.
+//
+// Internally the firmware still reasons in terms of "kill asserted" (engine
+// prevented from running). The inversion lives in exactly one place --
+// setKillRelay() in pump_controller.cpp -- alongside RELAY_ACTIVE_LOW.
+//
+// Set to false ONLY if you deliberately wired K3 to NO instead, which gives
+// up the fail-safe. The firmware will warn loudly at boot.
+constexpr bool KILL_RELAY_FAIL_SAFE_NC = true;
 
 static_assert(PIN_RELAY_STARTER != 0 && PIN_RELAY_STARTER != 1, "D0/D1 reserved for RX/TX");
 static_assert(PIN_RELAY_CHOKE   != 0 && PIN_RELAY_CHOKE   != 1, "D0/D1 reserved for RX/TX");
 static_assert(PIN_RELAY_KILL    != 0 && PIN_RELAY_KILL    != 1, "D0/D1 reserved for RX/TX");
-static_assert(PIN_RELAY_SPARE   != 0 && PIN_RELAY_SPARE   != 1, "D0/D1 reserved for RX/TX");
+static_assert(PIN_RELAY_VALVE   != 0 && PIN_RELAY_VALVE   != 1, "D0/D1 reserved for RX/TX");
 
 static_assert(PIN_RELAY_STARTER != PIN_RELAY_CHOKE, "relay pins must be distinct");
 static_assert(PIN_RELAY_STARTER != PIN_RELAY_KILL,  "relay pins must be distinct");
-static_assert(PIN_RELAY_STARTER != PIN_RELAY_SPARE, "relay pins must be distinct");
+static_assert(PIN_RELAY_STARTER != PIN_RELAY_VALVE, "relay pins must be distinct");
 static_assert(PIN_RELAY_CHOKE   != PIN_RELAY_KILL,  "relay pins must be distinct");
-static_assert(PIN_RELAY_CHOKE   != PIN_RELAY_SPARE, "relay pins must be distinct");
-static_assert(PIN_RELAY_KILL    != PIN_RELAY_SPARE, "relay pins must be distinct");
+static_assert(PIN_RELAY_CHOKE   != PIN_RELAY_VALVE, "relay pins must be distinct");
+static_assert(PIN_RELAY_KILL    != PIN_RELAY_VALVE, "relay pins must be distinct");
 
 // ---------------------------------------------------------------------------
 // Sequence timings (milliseconds)
@@ -96,6 +132,91 @@ constexpr uint32_t MIN_RECRANK_GAP_MS = 10000;
 // Backstop: choke may never remain commanded active longer than this. Under
 // normal operation the state machine releases it far sooner.
 constexpr uint32_t MAX_CHOKE_MS = 30000;
+
+// ---------------------------------------------------------------------------
+// Intake valve (K4) -- OPTIONAL
+// ---------------------------------------------------------------------------
+//
+// A 2" normally-closed 12 V solenoid valve on the pump INTAKE. De-energised =
+// CLOSED, so it shuts at power-on and on any power loss or reset.
+//
+// THINK HARD BEFORE ENABLING THIS.
+//
+// An electrically operated intake valve is the single most dangerous part of
+// this design. If it closes while the engine runs, the pump loses water and
+// runs dry; Honda warn that extended dry running destroys the mechanical
+// seal. Software cannot protect against a broken valve wire, a blown valve
+// fuse, or a mechanically stuck valve -- by the time the firmware could
+// notice, the seal is already going.
+//
+// If the tank line can safely stay pressurised, the simpler and more reliable
+// answer is to DELETE the electric valve: leave a manual intake valve open
+// permanently and fit a foot/check valve to retain prime. Then set this to 0,
+// K4 goes unused, and a whole class of failure disappears.
+//
+// If you do enable it, the hardwired water interlock below is MANDATORY.
+#ifndef ENABLE_INTAKE_VALVE
+#define ENABLE_INTAKE_VALVE 1
+#endif
+
+constexpr bool INTAKE_VALVE_ENABLED = (ENABLE_INTAKE_VALVE != 0);
+
+// How long the valve is held open to prime before the choke/crank sequence
+// begins. Tune to your suction lift and hose length.
+constexpr uint32_t VALVE_PRIME_MS = 5000;
+
+// After the kill circuit is grounded, how long to wait before closing the
+// valve. Gives the engine time to actually come to rest, so the intake is
+// never shut on a still-spinning pump.
+constexpr uint32_t VALVE_CLOSE_DELAY_MS = 3000;
+
+static_assert(VALVE_PRIME_MS > 0, "priming with a zero-length open is pointless");
+static_assert(VALVE_CLOSE_DELAY_MS > 0,
+              "the engine needs time to stop before the intake is shut");
+
+// ---------------------------------------------------------------------------
+// Water-available interlock (D6)
+// ---------------------------------------------------------------------------
+//
+// A pressure or flow switch on the intake, reporting that water is actually
+// present at the pump.
+//
+// THE PRIMARY PROTECTION IS HARDWIRED, NOT THIS INPUT. Wire the switch so it
+// grounds the ignition-kill wire directly -- in series with / parallel to K3's
+// NC contact -- so that losing water stops the engine even if this Arduino is
+// dead, hung, or has been unplugged. This firmware input is a SECOND,
+// independent layer: it lets the controller refuse to start, report the
+// condition over the API, and shut down in an orderly way.
+//
+// Wiring: switch closes to GND when water IS available. The pin uses
+// INPUT_PULLUP, so a broken wire or disconnected sensor reads HIGH = "no
+// water" = refuse to run. Failure of the sensor wiring is therefore safe.
+constexpr uint8_t WATER_OK_LEVEL = LOW;
+
+// Debounce: the reading must be stable this long before it is believed.
+// Pressure switches chatter around their setpoint, and a fire pump must not
+// shut down on a momentary dip.
+constexpr uint32_t WATER_DEBOUNCE_MS = 750;
+
+// Grace period after the starter is released before loss of water is acted
+// on, so a pump that has not yet built pressure is not immediately killed.
+constexpr uint32_t WATER_STARTUP_GRACE_MS = 15000;
+
+// When 0, the firmware treats water as always available. This exists ONLY so
+// the logic can be bench-tested before a sensor is fitted; it is refused at
+// compile time whenever the intake valve is enabled, because that combination
+// is the specific hazard this interlock exists to cover.
+#ifndef REQUIRE_WATER_INTERLOCK
+#define REQUIRE_WATER_INTERLOCK 1
+#endif
+
+constexpr bool WATER_INTERLOCK_REQUIRED = (REQUIRE_WATER_INTERLOCK != 0);
+
+static_assert(!INTAKE_VALVE_ENABLED || WATER_INTERLOCK_REQUIRED,
+              "An electrically operated intake valve without a water "
+              "interlock can run the pump dry and destroy the seal. Either "
+              "fit the interlock (REQUIRE_WATER_INTERLOCK=1) or delete the "
+              "electric valve (ENABLE_INTAKE_VALVE=0).");
 
 // ---------------------------------------------------------------------------
 // Per-request timing overrides

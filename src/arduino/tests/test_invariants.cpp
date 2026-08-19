@@ -49,8 +49,12 @@ class StarterWatch {
           const uint32_t d = static_cast<uint32_t>(e.at - onAt_);
           if (d > longest_) longest_ = d;
         }
-      } else if (e.pin == PIN_RELAY_SPARE && e.value == activeLevel()) {
-        spareWasActivated_ = true;
+      } else if (e.pin == PIN_RELAY_VALVE) {
+        valveOpen_ = (e.value == activeLevel());
+      }
+      // Re-evaluated on every edge of either line.
+      if (on_ && !valveOpen_ && INTAKE_VALVE_ENABLED) {
+        crankedWithIntakeShut_ = true;
       }
     }
   }
@@ -59,13 +63,14 @@ class StarterWatch {
     return on_ ? static_cast<uint32_t>(now - onAt_) : 0u;
   }
   uint32_t longest() const { return longest_; }
-  bool spareWasActivated() const { return spareWasActivated_; }
+  bool crankedWithIntakeShut() const { return crankedWithIntakeShut_; }
 
  private:
   bool     on_ = false;
   uint32_t onAt_ = 0;
   uint32_t longest_ = 0;
-  bool     spareWasActivated_ = false;
+  bool     valveOpen_ = false;
+  bool     crankedWithIntakeShut_ = false;
 };
 
 // The invariants that must hold at absolutely every observable moment.
@@ -84,16 +89,41 @@ void checkInvariants(const PumpController& p, const StarterWatch& w,
   // 1. Starter and kill are never energised together.
   CHECK_MSG(!(p.starterActive() && p.killActive()),
             std::string("starter and kill both active; ") + ctx);
+  // Physically: the starter is never energised while K3 is de-energised,
+  // because a de-energised K3 has its NC contact closed onto engine ground.
   CHECK_MSG(!(fake::pinLevel[PIN_RELAY_STARTER] == activeLevel() &&
-              fake::pinLevel[PIN_RELAY_KILL] == activeLevel()),
-            std::string("starter and kill pins both active; ") + ctx);
+              fake::pinLevel[PIN_RELAY_KILL] == killPinLevelFor(true)),
+            std::string("starter energised with the kill wire grounded; ") + ctx);
 
-  // 2. The spare relay is never energised.
-  CHECK_MSG(!p.spareActive(), std::string("spare active; ") + ctx);
-  CHECK_MSG(fake::pinLevel[PIN_RELAY_SPARE] == inactiveLevel(),
-            std::string("spare pin active; ") + ctx);
-  CHECK_MSG(!w.spareWasActivated(),
-            std::string("spare was pulsed at some point; ") + ctx);
+  // 2a. The starter is never engaged with the intake shut, and never with the
+  //     kill asserted. These are the two preconditions for cranking.
+  CHECK_MSG(!(p.starterActive() && !p.valveActive() && INTAKE_VALVE_ENABLED),
+            std::string("cranking with the intake shut; ") + ctx);
+  CHECK_MSG(!(p.starterActive() && p.killActive()),
+            std::string("cranking with the kill asserted; ") + ctx);
+  CHECK_MSG(!w.crankedWithIntakeShut(),
+            std::string("cranked with the intake shut at some point; ") + ctx);
+
+  // 2b. Whenever the engine has actually been cranked and could be running,
+  //     the intake is open.
+  //
+  //     STOPPING is excluded deliberately: it is reachable from ANY state,
+  //     including IDLE where the engine was never started and the intake is
+  //     legitimately shut. The guarantee that matters -- that the intake is
+  //     never shut *while* the engine runs -- is a property of the
+  //     transition, enforced in setValveRelay(), and is asserted directly in
+  //     test_valve_water.cpp.
+  if (INTAKE_VALVE_ENABLED) {
+    const bool startedByUs = (p.state() == PumpState::CRANKING ||
+                              p.state() == PumpState::UNCHOKING ||
+                              p.state() == PumpState::RUNNING_ASSUMED);
+    CHECK_MSG(!(startedByUs && !p.valveActive()),
+              std::string("running with the intake shut; ") + ctx);
+  }
+
+  // 2c. The kill pin always matches the fail-safe wiring inversion.
+  CHECK_MSG(fake::pinLevel[PIN_RELAY_KILL] == killPinLevelFor(p.killActive()),
+            std::string("kill pin does not match the asserted state; ") + ctx);
 
   // 3. The core starter guarantee: at the end of every tick the starter is
   //    either released, or has been engaged for strictly less than the
@@ -117,19 +147,20 @@ void checkInvariants(const PumpController& p, const StarterWatch& w,
   CHECK_MSG(fake::pinLevel[PIN_RELAY_CHOKE] ==
                 (p.chokeActive() ? activeLevel() : inactiveLevel()),
             std::string("choke pin/state disagreement; ") + ctx);
-  CHECK_MSG(fake::pinLevel[PIN_RELAY_KILL] ==
-                (p.killActive() ? activeLevel() : inactiveLevel()),
-            std::string("kill pin/state disagreement; ") + ctx);
+  CHECK_MSG(fake::pinLevel[PIN_RELAY_VALVE] ==
+                (p.valveActive() ? activeLevel() : inactiveLevel()),
+            std::string("valve pin/state disagreement; ") + ctx);
 
   // 5. The engine is never reported as confirmed running.
   CHECK_MSG(!p.runningConfirmed(),
             std::string("running_confirmed became true; ") + ctx);
 
-  // 6. Quiescence implies no relay is energised, since quiescence is what
-  //    permits a blocking Wi-Fi reconnect.
+  // 6. Quiescence means no relay timing is pending, which is what permits a
+  //    blocking Wi-Fi reconnect. The kill and valve are excluded by design --
+  //    see PumpController::isQuiescent().
   if (p.isQuiescent()) {
-    CHECK_MSG(!p.starterActive() && !p.chokeActive() && !p.killActive(),
-              std::string("quiescent with a relay energised; ") + ctx);
+    CHECK_MSG(!p.starterActive() && !p.chokeActive(),
+              std::string("quiescent while a timed relay was energised; ") + ctx);
   }
 }
 
@@ -193,8 +224,9 @@ uint32_t fuzzSession(uint32_t seed, uint32_t iterations, uint32_t startClock,
 
       // START is only ever accepted out of IDLE with no cooldown left.
       if (cmd == CommandType::START && r.accepted && !r.duplicate) {
-        CHECK_MSG(p.state() == PumpState::CHOKING,
-                  "an accepted START did not enter CHOKING");
+        CHECK_MSG(p.state() == (INTAKE_VALVE_ENABLED ? PumpState::PRIMING
+                                                     : PumpState::CHOKING),
+                  "an accepted START did not begin the start sequence");
       }
     }
   }
@@ -206,9 +238,28 @@ uint32_t fuzzSession(uint32_t seed, uint32_t iterations, uint32_t startClock,
     watch.scan(cursor);
     checkInvariants(p, watch, fake::nowMs, seed, 100000 + i, !allowLargeJumps);
   }
+  // Settling means no timed sequence is pending -- NOT that everything is
+  // off. RUNNING_ASSUMED is a legitimate resting state that holds the kill
+  // released and the intake open indefinitely, by design.
   CHECK_MSG(!p.starterActive(), "starter still energised after settling");
   CHECK_MSG(!p.chokeActive(), "choke still energised after settling");
-  CHECK_MSG(!p.killActive(), "kill still energised after settling");
+
+  if (p.state() == PumpState::RUNNING_ASSUMED) {
+    CHECK_MSG(!p.killActive(), "RUNNING_ASSUMED with the engine inhibited");
+    if (INTAKE_VALVE_ENABLED) {
+      CHECK_MSG(p.valveActive(), "RUNNING_ASSUMED with the intake shut");
+    }
+  } else if (p.state() == PumpState::IDLE ||
+             p.state() == PumpState::RETRY_WAIT ||
+             p.state() == PumpState::UNKNOWN) {
+    // At rest the engine must be inhibited and the intake shut.
+    CHECK_MSG(p.killActive(), "settled at rest without inhibiting the engine");
+    CHECK_MSG(fake::pinLevel[PIN_RELAY_KILL] == killPinLevelFor(true),
+              "the kill pin was not at its fail-safe level at rest");
+    if (INTAKE_VALVE_ENABLED) {
+      CHECK_MSG(!p.valveActive(), "intake left open at rest");
+    }
+  }
 
   return commandsIssued;
 }
@@ -269,12 +320,19 @@ TEST(fuzz_stop_always_wins_from_any_reachable_situation) {
     CHECK_MSG(p.killActive(), "STOP did not ground the kill circuit");
     CHECK_MSG(p.state() == PumpState::STOPPING, "STOP did not enter STOPPING");
     CHECK_EQ(fake::pinLevel[PIN_RELAY_STARTER], inactiveLevel());
-    CHECK_EQ(fake::pinLevel[PIN_RELAY_KILL], activeLevel());
+    // Kill asserted == K3 de-energised == NC contact grounding the ignition.
+    CHECK_EQ(fake::pinLevel[PIN_RELAY_KILL], killPinLevelFor(true));
 
-    // And it always completes, returning to IDLE with the kill released.
-    advanceBy(p, KILL_HOLD_MS, 7);
-    CHECK_MSG(p.state() == PumpState::IDLE, "STOP did not settle back to IDLE");
-    CHECK_MSG(!p.killActive(), "kill was never released after the hold");
+    // And it always completes: kill hold, then the intake close delay, landing
+    // in IDLE with the engine still inhibited and the intake shut.
+    advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS + 100, 7);
+    CHECK_MSG(p.state() == PumpState::IDLE,
+              std::string("STOP did not settle back to IDLE; ended in ") +
+                  toString(p.state()));
+    CHECK_MSG(p.killActive(), "the kill was released after the stop completed");
+    if (INTAKE_VALVE_ENABLED) {
+      CHECK_MSG(!p.valveActive(), "STOP left the intake open");
+    }
   }
 }
 

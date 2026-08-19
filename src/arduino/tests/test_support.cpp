@@ -23,10 +23,26 @@ void jumpBy(PumpController& p, uint32_t dt) {
   tickAt(p, static_cast<uint32_t>(fake::nowMs + dt));
 }
 
+void setWaterRaw(bool available) {
+  // WATER_OK_LEVEL is LOW: the switch closes to ground when water is present,
+  // so a broken wire (pull-up, HIGH) reads as "no water".
+  fake::pinLevel[PIN_WATER_OK] = available ? LOW : HIGH;
+}
+
+void setWaterAvailable(PumpController& p, bool available) {
+  setWaterRaw(available);
+  advanceBy(p, WATER_DEBOUNCE_MS + 50, 25);
+}
+
 void bootAt(PumpController& p, uint32_t startMs) {
   fake::reset();
   fake::nowMs = startMs;
+  // Water present by default; tests that care drive it explicitly.
+  setWaterRaw(true);
   p.begin(startMs);
+  // Let the interlock debounce settle, as it would in the first second of a
+  // real boot. Tests exercising the debounce itself boot and drive it by hand.
+  advanceBy(p, WATER_DEBOUNCE_MS + 50, 25);
 }
 
 bool driveToState(PumpController& p, PumpState target) {
@@ -38,10 +54,25 @@ bool driveToState(PumpController& p, PumpState target) {
       p.handleCommand(CommandType::RESET_IDLE, "fixture-idle", fake::nowMs);
       return p.state() == PumpState::IDLE;
 
-    case PumpState::CHOKING:
+    case PumpState::PRIMING:
       if (!driveToState(p, PumpState::IDLE)) return false;
       p.handleCommand(CommandType::START, "fixture-start", fake::nowMs);
+      return p.state() == PumpState::PRIMING;
+
+    case PumpState::CHOKING:
+      if (INTAKE_VALVE_ENABLED) {
+        if (!driveToState(p, PumpState::PRIMING)) return false;
+        advanceBy(p, VALVE_PRIME_MS);
+      } else {
+        if (!driveToState(p, PumpState::IDLE)) return false;
+        p.handleCommand(CommandType::START, "fixture-start", fake::nowMs);
+      }
       return p.state() == PumpState::CHOKING;
+
+    case PumpState::VALVE_CLOSING:
+      if (!driveToState(p, PumpState::STOPPING)) return false;
+      advanceBy(p, KILL_HOLD_MS);
+      return p.state() == PumpState::VALVE_CLOSING;
 
     case PumpState::CRANKING:
       if (!driveToState(p, PumpState::CHOKING)) return false;
@@ -132,14 +163,30 @@ void checkRelayPins(const PumpController& p, const char* where) {
             std::string("starter pin mismatch at ") + where);
   CHECK_MSG(fake::pinLevel[PIN_RELAY_CHOKE] == (p.chokeActive() ? on : off),
             std::string("choke pin mismatch at ") + where);
-  CHECK_MSG(fake::pinLevel[PIN_RELAY_KILL] == (p.killActive() ? on : off),
+  // Fail-safe inversion: kill asserted == relay de-energised.
+  CHECK_MSG(fake::pinLevel[PIN_RELAY_KILL] == killPinLevelFor(p.killActive()),
             std::string("kill pin mismatch at ") + where);
-  CHECK_MSG(fake::pinLevel[PIN_RELAY_SPARE] == off,
-            std::string("spare pin not inactive at ") + where);
+  CHECK_MSG(fake::pinLevel[PIN_RELAY_VALVE] == (p.valveActive() ? on : off),
+            std::string("valve pin mismatch at ") + where);
 }
 
-void checkSpareNeverActive(const char* where) {
-  const size_t idx = fake::firstWriteIndex(PIN_RELAY_SPARE, activeLevel());
-  CHECK_MSG(idx == SIZE_MAX,
-            std::string("K4/D5 was driven active at ") + where);
+void checkStarterNeverCrankedWithKillAsserted(const char* where) {
+  // Replay the whole pin log and check the two lines were never in the
+  // combination that would crank against a grounded ignition.
+  bool starterOn = false;
+  bool killEnergised = false;
+  for (const fake::Event& e : fake::events) {
+    if (e.kind != fake::EventKind::DIGITAL_WRITE) continue;
+    if (e.pin == PIN_RELAY_STARTER) {
+      starterOn = (e.value == activeLevel());
+    } else if (e.pin == PIN_RELAY_KILL) {
+      killEnergised = (e.value == activeLevel());
+    } else {
+      continue;
+    }
+    const bool killAsserted = KILL_RELAY_FAIL_SAFE_NC ? !killEnergised
+                                                      : killEnergised;
+    CHECK_MSG(!(starterOn && killAsserted),
+              std::string("starter engaged with kill asserted at ") + where);
+  }
 }

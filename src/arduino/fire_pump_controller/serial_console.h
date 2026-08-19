@@ -63,11 +63,18 @@ class SerialConsole {
   void clearScanRequest() { scanRequested_ = false; }
 
  private:
+  // The lamp test drives the relays through the REAL interlocks, so it has to
+  // follow the same order a genuine start does: intake open, prime dwell,
+  // release the kill, only then pulse the starter. Anything else is refused
+  // by PumpController, which is the point.
   enum class LampPhase : uint8_t {
     OFF = 0,
     CHOKE_ON, CHOKE_OFF,
+    VALVE_ON, PRIME_WAIT,
+    KILL_RELEASE,
     STARTER_ON, STARTER_OFF,
-    KILL_ON, KILL_OFF,
+    KILL_ASSERT,
+    VALVE_OFF,
   };
 
   void handleLine(uint32_t now, PumpController& pump, const NetManager& net);

@@ -35,7 +35,7 @@ TEST(a_missing_secret_returns_401_on_every_endpoint) {
     CHECK_MSG(status == 401, e.p);
     CHECK_CONTAINS(body, "\"error\":\"unauthorized\"");
     CHECK_MSG(p.state() == PumpState::IDLE, "an unauthenticated request changed state");
-    CHECK(!p.starterActive() && !p.chokeActive() && !p.killActive());
+    CHECK(!p.starterActive() && !p.chokeActive() && !p.valveActive());
   }
 }
 
@@ -269,18 +269,19 @@ TEST(status_reports_the_live_controller_and_network_state) {
   CHECK_CONTAINS(body, "\"starter\":true");
   CHECK_CONTAINS(body, "\"choke\":true");
   CHECK_CONTAINS(body, "\"kill\":false");
-  CHECK_CONTAINS(body, "\"spare\":false");
+  CHECK_CONTAINS(body, "\"valve\":true");
   CHECK_CONTAINS(body, "\"ip\":\"192.168.1.50\"");
   CHECK_CONTAINS(body, "\"rssi_dbm\":-57");
   CHECK_CONTAINS(body, "\"device\":\"fire-pump-controller\"");
-  CHECK_CONTAINS(body, "\"firmware_version\":\"0.1.0\"");
+  CHECK_CONTAINS(body, "\"firmware_version\":\"0.2.0\"");
 }
 
 TEST(status_never_reports_confirmed_engine_operation_in_any_state) {
   const PumpState all[] = {
-      PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::CHOKING,
-      PumpState::CRANKING,  PumpState::UNCHOKING,   PumpState::RUNNING_ASSUMED,
-      PumpState::STOPPING,  PumpState::RETRY_WAIT,  PumpState::FAULT,
+      PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::PRIMING,
+      PumpState::CHOKING,   PumpState::CRANKING,    PumpState::UNCHOKING,
+      PumpState::RUNNING_ASSUMED, PumpState::STOPPING, PumpState::VALVE_CLOSING,
+      PumpState::RETRY_WAIT, PumpState::FAULT,
   };
   for (PumpState s : all) {
     PumpController p;
@@ -305,7 +306,7 @@ TEST(status_reports_a_fault_and_clears_it_after_recovery) {
   CHECK_CONTAINS(body, "\"state\":\"FAULT\"");
   CHECK_CONTAINS(body, "\"fault\":\"STARTER_OVERRUN\"");
 
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   send(p, "POST", "/v1/reset-idle", kTestSecret, "clear-1", status);
   CHECK_EQ(status, 202);
 
@@ -344,7 +345,7 @@ TEST(start_returns_202_from_idle_and_409_otherwise) {
   body = send(p, "POST", "/v1/start", kTestSecret, "start-002", status);
   CHECK_EQ(status, 202);
   CHECK_CONTAINS(body, "\"accepted\":true");
-  CHECK_CONTAINS(body, "\"state\":\"CHOKING\"");
+  CHECK_CONTAINS(body, INTAKE_VALVE_ENABLED ? "\"state\":\"PRIMING\"" : "\"state\":\"CHOKING\"");
   CHECK_CONTAINS(body, "\"request_id\":\"start-002\"");
 }
 
@@ -355,7 +356,7 @@ TEST(a_409_reports_the_current_state_and_cooldown_remaining) {
 
   uint16_t status = 0;
   send(p, "POST", "/v1/stop", kTestSecret, "stop-1", status);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
 
   const std::string body = send(p, "POST", "/v1/start", kTestSecret, "start-9", status);
   CHECK_EQ(status, 409);
@@ -366,9 +367,10 @@ TEST(a_409_reports_the_current_state_and_cooldown_remaining) {
 
 TEST(stop_returns_202_from_every_state_over_http) {
   const PumpState all[] = {
-      PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::CHOKING,
-      PumpState::CRANKING,  PumpState::UNCHOKING,   PumpState::RUNNING_ASSUMED,
-      PumpState::STOPPING,  PumpState::RETRY_WAIT,  PumpState::FAULT,
+      PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::PRIMING,
+      PumpState::CHOKING,   PumpState::CRANKING,    PumpState::UNCHOKING,
+      PumpState::RUNNING_ASSUMED, PumpState::STOPPING, PumpState::VALVE_CLOSING,
+      PumpState::RETRY_WAIT, PumpState::FAULT,
   };
   for (PumpState s : all) {
     PumpController p;
@@ -421,6 +423,8 @@ TEST(a_replayed_start_request_is_marked_duplicate_and_cranks_only_once) {
   const std::string b2 = send(p, "POST", "/v1/start", kTestSecret, "start-001", s2);
   const std::string b3 = send(p, "POST", "/v1/start", kTestSecret, "start-001", s3);
 
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
+
   CHECK_EQ(s1, 202);
   CHECK_CONTAINS(b1, "\"duplicate\":false");
   CHECK_EQ(s2, 202);
@@ -449,6 +453,7 @@ TEST(duplicate_responses_report_the_current_state_not_a_stale_one) {
 
   uint16_t status = 0;
   send(p, "POST", "/v1/start", kTestSecret, "start-001", status);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
   advanceBy(p, CHOKE_PREP_MS);   // now CRANKING
 
   const std::string body = send(p, "POST", "/v1/start", kTestSecret, "start-001", status);

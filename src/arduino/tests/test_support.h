@@ -22,11 +22,11 @@ struct PumpTestAccess {
   static void setStarter(PumpController& p, bool a) { p.setStarterRelay(a); }
   static void setChoke(PumpController& p, bool a) { p.setChokeRelay(a); }
   static void setKill(PumpController& p, bool a) { p.setKillRelay(a); }
-  static void setSpare(PumpController& p, bool a) { p.setSpareRelay(a); }
+  static void setValve(PumpController& p, bool a) { p.setValveRelay(a); }
 
   // Simulates a corrupted/blown-through internal state that enforceSafety()
   // must catch, without needing a real hardware fault.
-  static void corruptSpareFlag(PumpController& p) { p.spareActive_ = true; }
+  static void corruptValveFlag(PumpController& p, bool a) { p.valveActive_ = a; }
   static void corruptStarterFlag(PumpController& p, bool a) { p.starterActive_ = a; }
   static void corruptKillFlag(PumpController& p, bool a) { p.killActive_ = a; }
   static void setStarterOnAt(PumpController& p, uint32_t t) { p.starterOnAt_ = t; }
@@ -45,6 +45,24 @@ struct PumpTestAccess {
 // derived from the single RELAY_ACTIVE_LOW constant under test.
 inline uint8_t activeLevel() { return RELAY_ACTIVE_LOW ? LOW : HIGH; }
 inline uint8_t inactiveLevel() { return RELAY_ACTIVE_LOW ? HIGH : LOW; }
+
+// K3 is wired to its NC contact, so the relay must be ENERGISED to permit the
+// engine to run. "Kill asserted" therefore means the relay is de-energised.
+inline bool killRelayEnergised(bool killAsserted) {
+  return KILL_RELAY_FAIL_SAFE_NC ? !killAsserted : killAsserted;
+}
+inline uint8_t killPinLevelFor(bool killAsserted) {
+  return killRelayEnergised(killAsserted) ? activeLevel() : inactiveLevel();
+}
+
+// --- water interlock -------------------------------------------------------
+
+// Sets the raw level on the water-available input. The reading still has to
+// survive WATER_DEBOUNCE_MS before the controller believes it.
+void setWaterRaw(bool available);
+
+// Sets the input and ticks long enough for the debounce to settle.
+void setWaterAvailable(PumpController& p, bool available);
 
 // --- clock driving ---------------------------------------------------------
 
@@ -86,8 +104,10 @@ std::string makeRequest(const char* method, const char* path,
 
 // --- relay assertions ------------------------------------------------------
 
-// Asserts the controller's logical view and the physical pin levels agree.
+// Asserts the controller's logical view and the physical pin levels agree,
+// including the K3 fail-safe inversion.
 void checkRelayPins(const PumpController& p, const char* where);
 
-// Asserts K4/D5 has never been driven to its active level.
-void checkSpareNeverActive(const char* where);
+// Asserts the starter pin was never driven active while the kill relay was
+// de-energised (kill asserted) -- checked over the whole recorded event log.
+void checkStarterNeverCrankedWithKillAsserted(const char* where);

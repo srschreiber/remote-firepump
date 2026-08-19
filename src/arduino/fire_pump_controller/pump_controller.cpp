@@ -12,11 +12,13 @@ const char* toString(PumpState s) {
   switch (s) {
     case PumpState::UNKNOWN:         return "UNKNOWN";
     case PumpState::IDLE:            return "IDLE";
+    case PumpState::PRIMING:         return "PRIMING";
     case PumpState::CHOKING:         return "CHOKING";
     case PumpState::CRANKING:        return "CRANKING";
     case PumpState::UNCHOKING:       return "UNCHOKING";
     case PumpState::RUNNING_ASSUMED: return "RUNNING_ASSUMED";
     case PumpState::STOPPING:        return "STOPPING";
+    case PumpState::VALVE_CLOSING:   return "VALVE_CLOSING";
     case PumpState::RETRY_WAIT:      return "RETRY_WAIT";
     case PumpState::FAULT:           return "FAULT";
   }
@@ -36,6 +38,8 @@ const char* toString(CommandType c) {
     case CommandType::MAINT_STARTER_OFF: return "MAINT_STARTER_OFF";
     case CommandType::MAINT_KILL_ON:     return "MAINT_KILL_ON";
     case CommandType::MAINT_KILL_OFF:    return "MAINT_KILL_OFF";
+    case CommandType::MAINT_VALVE_ON:    return "MAINT_VALVE_ON";
+    case CommandType::MAINT_VALVE_OFF:   return "MAINT_VALVE_OFF";
   }
   return "NONE";
 }
@@ -48,6 +52,8 @@ bool isMaintenanceCommand(CommandType c) {
     case CommandType::MAINT_STARTER_OFF:
     case CommandType::MAINT_KILL_ON:
     case CommandType::MAINT_KILL_OFF:
+    case CommandType::MAINT_VALVE_ON:
+    case CommandType::MAINT_VALVE_OFF:
       return true;
     default:
       return false;
@@ -71,7 +77,9 @@ const char* toString(FaultCode f) {
     case FaultCode::STARTER_KILL_CONFLICT: return "STARTER_KILL_CONFLICT";
     case FaultCode::STARTER_OVERRUN:       return "STARTER_OVERRUN";
     case FaultCode::CHOKE_OVERRUN:         return "CHOKE_OVERRUN";
-    case FaultCode::SPARE_ACTIVE:          return "SPARE_ACTIVE";
+    case FaultCode::VALVE_CLOSED_WHILE_RUNNING:
+      return "VALVE_CLOSED_WHILE_RUNNING";
+    case FaultCode::WATER_LOST:            return "WATER_LOST";
     case FaultCode::ILLEGAL_TRANSITION:    return "ILLEGAL_TRANSITION";
   }
   return nullptr;
@@ -97,6 +105,87 @@ void PumpController::initRelayPin(uint8_t pin) {
   setRelayOutput(pin, false);
 }
 
+bool PumpController::engineMayBeRunning() const {
+  // Used to REFUSE shutting the intake. Deliberately includes STOPPING: the
+  // kill has only just been grounded and the engine is still winding down.
+  switch (state_) {
+    case PumpState::CRANKING:
+    case PumpState::UNCHOKING:
+    case PumpState::RUNNING_ASSUMED:
+    case PumpState::STOPPING:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool PumpController::engineWasStarted() const {
+  // Used to detect a pump running DRY. Narrower than engineMayBeRunning():
+  // these are the only states reachable by actually cranking, so a shut
+  // intake here means the engine really is turning without water. STOPPING is
+  // excluded because it is reachable from IDLE, where the engine was never
+  // started and a shut intake is entirely correct.
+  switch (state_) {
+    case PumpState::CRANKING:
+    case PumpState::UNCHOKING:
+    case PumpState::RUNNING_ASSUMED:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool PumpController::primeComplete() const {
+  // Water must be present regardless of how the intake is controlled -- that
+  // is the actual precondition for cranking, not the position of a valve.
+  if (!waterOk_) {
+    return false;
+  }
+  if (!INTAKE_VALVE_ENABLED) {
+    // No electric valve in this build: a permanently open manual intake plus
+    // a foot/check valve holds prime, so the water interlock is the whole
+    // condition.
+    return true;
+  }
+  return valveActive_ &&
+         static_cast<uint32_t>(now_ - valveOpenedAt_) >= VALVE_PRIME_MS;
+}
+
+void PumpController::setValveRelay(bool active) {
+  if (active) {
+    if (!valveActive_) {
+      valveActive_ = true;
+      valveOpenedAt_ = now_;
+      setRelayOutput(PIN_RELAY_VALVE, true);
+      Serial.println(F("[RELAY] valve OPEN"));
+    }
+    return;
+  }
+
+  // Hard interlock: never shut the INTAKE while the engine could still be
+  // turning. Closing it starves the pump of water and it runs dry; the water
+  // is what lubricates and cools the mechanical seal, and Honda warn that
+  // extended dry running destroys it. The stop sequence therefore always
+  // grounds the kill wire first and only shuts the intake after
+  // VALVE_CLOSE_DELAY_MS in VALVE_CLOSING.
+  //
+  // NOTE: this is the software layer only. It cannot help against a broken
+  // valve wire, a blown valve fuse or a mechanically stuck valve -- that is
+  // what the hardwired water interlock is for. See config.h.
+  if (engineMayBeRunning()) {
+    Serial.println(F("[SAFETY] refused intake close: engine may be running"));
+    return;
+  }
+
+  if (valveActive_) {
+    valveActive_ = false;
+    setRelayOutput(PIN_RELAY_VALVE, false);
+    Serial.println(F("[RELAY] valve CLOSED"));
+  } else {
+    setRelayOutput(PIN_RELAY_VALVE, false);
+  }
+}
+
 void PumpController::setStarterRelay(bool active) {
   if (active) {
     // Hard interlock: the starter may never be engaged while the ignition
@@ -105,6 +194,14 @@ void PumpController::setStarterRelay(bool active) {
     if (killActive_) {
       Serial.println(F("[SAFETY] refused starter: kill relay active"));
       enterFault(FaultCode::STARTER_KILL_CONFLICT);
+      return;
+    }
+    // Hard interlock: never crank unless priming is complete. "Complete"
+    // means the valve is open AND has been open for the full prime dwell --
+    // an open valve alone does not mean the pump is primed.
+    if (!primeComplete()) {
+      Serial.println(F("[SAFETY] refused starter: not primed"));
+      enterFault(FaultCode::VALVE_CLOSED_WHILE_RUNNING);
       return;
     }
     if (!starterActive_) {
@@ -145,6 +242,16 @@ void PumpController::setChokeRelay(bool active) {
   }
 }
 
+void PumpController::driveKillOutput(bool killAsserted) {
+  // The ONLY place the fail-safe wiring inversion is applied.
+  //
+  // With K3 on its NC contact the relay must be ENERGISED for the engine to
+  // be permitted to run, so asserting kill means DE-energising the relay.
+  // Everything above this line reasons in terms of "kill asserted".
+  const bool energise = KILL_RELAY_FAIL_SAFE_NC ? !killAsserted : killAsserted;
+  setRelayOutput(PIN_RELAY_KILL, energise);
+}
+
 void PumpController::setKillRelay(bool active) {
   if (active) {
     // Hard interlock: grounding the kill circuit always releases the starter
@@ -157,33 +264,30 @@ void PumpController::setKillRelay(bool active) {
     }
     if (!killActive_) {
       killActive_ = true;
-      setRelayOutput(PIN_RELAY_KILL, true);
+      driveKillOutput(true);
       Serial.println(F("[RELAY] kill ON"));
     }
   } else {
     if (killActive_) {
       killActive_ = false;
-      setRelayOutput(PIN_RELAY_KILL, false);
+      driveKillOutput(false);
       Serial.println(F("[RELAY] kill OFF"));
     } else {
-      setRelayOutput(PIN_RELAY_KILL, false);
+      driveKillOutput(false);
     }
   }
 }
 
-void PumpController::setSpareRelay(bool active) {
-  // K4 is reserved. It is never activated by this firmware revision; the
-  // argument exists only so the call site reads consistently.
-  (void)active;
-  spareActive_ = false;
-  setRelayOutput(PIN_RELAY_SPARE, false);
-}
-
-void PumpController::allRelaysInactive() {
+void PumpController::toSafeState() {
+  // "Safe" is NOT "all relays de-energised". With the fail-safe wiring the
+  // kill must be ASSERTED (K3 de-energised, NC contact grounding the ignition)
+  // so the engine is inhibited. Releasing it here would leave a magneto engine
+  // free to run.
   setStarterRelay(false);
   setChokeRelay(false);
-  setKillRelay(false);
-  setSpareRelay(false);
+  setKillRelay(true);
+  // Refused, and correctly so, if the engine may still be running.
+  setValveRelay(false);
 }
 
 void PumpController::noteStarterReleased() {
@@ -203,16 +307,30 @@ void PumpController::begin(uint32_t now) {
   initRelayPin(PIN_RELAY_STARTER);
   initRelayPin(PIN_RELAY_CHOKE);
   initRelayPin(PIN_RELAY_KILL);
-  initRelayPin(PIN_RELAY_SPARE);
+  initRelayPin(PIN_RELAY_VALVE);
+
+  // Water interlock input. INPUT_PULLUP means a broken wire or absent sensor
+  // reads HIGH, which WATER_OK_LEVEL defines as "no water" -- so a wiring
+  // failure fails safe.
+  pinMode(PIN_WATER_OK, INPUT_PULLUP);
 
   starterActive_ = false;
   chokeActive_   = false;
-  killActive_    = false;
-  spareActive_   = false;
+  // Fail-safe wiring: initRelayPin() left K3 de-energised, which closes its NC
+  // contact and grounds the kill wire. So at boot the kill is ASSERTED -- the
+  // engine is inhibited until the controller deliberately permits it to run.
+  killActive_    = KILL_RELAY_FAIL_SAFE_NC;
+  // Normally-closed valve: de-energised at reset means physically shut.
+  valveActive_   = false;
+
+  waterOk_ = false;
+  waterRawLast_ = false;
+  waterStableSince_ = now;
 
   fault_ = FaultCode::NONE;
   faultKillActive_ = false;
   starterEverReleased_ = false;
+  valveOpenedAt_ = now;
 
   // Per-request overrides never survive a reboot.
   timings_ = StartTimings();
@@ -253,10 +371,11 @@ void PumpController::enterFault(FaultCode code) {
   const char* name = toString(code);
   Serial.println(name != nullptr ? name : "NONE");
 
-  // Always shed the two relays that can do harm.
+  // Always shed the two relays that can do harm. The valve is deliberately
+  // NOT touched here: if the engine might be running, shutting it would
+  // deadhead the pump, and if it is not running an open valve is harmless.
   setStarterRelay(false);
   setChokeRelay(false);
-  setSpareRelay(false);
 
   if (mightBeRunning) {
     // Prefer stop/kill behaviour: if the engine could be turning, ground the
@@ -265,7 +384,9 @@ void PumpController::enterFault(FaultCode code) {
     faultKillActive_ = true;
     faultKillStartedAt_ = now_;
   } else {
-    setKillRelay(false);
+    // Engine is not believed to be running, but assert the kill anyway --
+    // it is the resting, fail-safe position.
+    setKillRelay(true);
     faultKillActive_ = false;
   }
 
@@ -276,8 +397,54 @@ void PumpController::enterFault(FaultCode code) {
 // Safety enforcement — runs before the state machine on every tick
 // ---------------------------------------------------------------------------
 
+void PumpController::updateWaterInterlock(uint32_t now) {
+  if (!WATER_INTERLOCK_REQUIRED) {
+    // Bench builds with no sensor fitted. Compile-time-refused whenever the
+    // electric intake valve is enabled; see the static_assert in config.h.
+    waterOk_ = true;
+    return;
+  }
+
+  const bool raw = (digitalRead(PIN_WATER_OK) == WATER_OK_LEVEL);
+  if (raw != waterRawLast_) {
+    waterRawLast_ = raw;
+    waterStableSince_ = now;
+    return;
+  }
+  // Only believe a reading that has held steady. Pressure switches chatter
+  // around their setpoint and a fire pump must not trip on a momentary dip.
+  if (static_cast<uint32_t>(now - waterStableSince_) >= WATER_DEBOUNCE_MS) {
+    if (waterOk_ != raw) {
+      Serial.print(F("[WATER] "));
+      Serial.println(raw ? F("available") : F("LOST"));
+    }
+    waterOk_ = raw;
+  }
+}
+
+bool PumpController::waterStartupGraceActive(uint32_t now) const {
+  // Straight after a crank the pump has not built pressure yet, so the switch
+  // legitimately reads dry for a while.
+  return starterEverReleased_ &&
+         static_cast<uint32_t>(now - lastStarterReleaseAt_) < WATER_STARTUP_GRACE_MS;
+}
+
 void PumpController::enforceSafety(uint32_t now) {
   now_ = now;
+
+  updateWaterInterlock(now);
+
+  // 0. Loss of water while the engine may be running. The hardwired interlock
+  //    is the real protection -- it grounds the kill wire without any help
+  //    from this firmware -- but shutting down deliberately here means the
+  //    controller's reported state matches reality and the intake is closed
+  //    in an orderly way afterwards.
+  if (engineWasStarted() && !waterOk_ && !waterStartupGraceActive(now) &&
+      fault_ != FaultCode::WATER_LOST) {
+    Serial.println(F("[SAFETY] water lost while running; stopping engine"));
+    enterFault(FaultCode::WATER_LOST);
+    return;
+  }
 
   // 1. Starter and kill must never be commanded active simultaneously.
   if (starterActive_ && killActive_) {
@@ -290,12 +457,30 @@ void PumpController::enforceSafety(uint32_t now) {
     return;
   }
 
-  // 2. The spare relay must never be active.
-  if (spareActive_) {
-    setRelayOutput(PIN_RELAY_SPARE, false);
-    spareActive_ = false;
-    if (fault_ != FaultCode::SPARE_ACTIVE) {
-      enterFault(FaultCode::SPARE_ACTIVE);
+  // 2. The starter must never be engaged with the discharge valve shut, and
+  //    the valve must never be shut while the engine could be turning. Both
+  //    directions of the deadhead interlock are re-checked every tick.
+  if (starterActive_ && !valveActive_) {
+    setRelayOutput(PIN_RELAY_STARTER, false);
+    starterActive_ = false;
+    noteStarterReleased();
+    Serial.println(F("[SAFETY] starter forced off: valve is closed"));
+    if (fault_ != FaultCode::VALVE_CLOSED_WHILE_RUNNING) {
+      enterFault(FaultCode::VALVE_CLOSED_WHILE_RUNNING);
+    }
+    return;
+  }
+  // Narrower than engineMayBeRunning(): STOPPING is reachable from IDLE,
+  // where the engine was never started and a shut intake is correct. Only the
+  // states we can only have arrived at by cranking imply the engine is
+  // actually turning.
+  if (engineWasStarted() && !valveActive_) {
+    // The engine is turning with the intake shut, so the pump is running dry.
+    // Reopening is the only safe response.
+    Serial.println(F("[SAFETY] intake reopened: engine is running dry"));
+    setValveRelay(true);
+    if (fault_ != FaultCode::VALVE_CLOSED_WHILE_RUNNING) {
+      enterFault(FaultCode::VALVE_CLOSED_WHILE_RUNNING);
     }
     return;
   }
@@ -336,8 +521,29 @@ void PumpController::advance(uint32_t now) {
   switch (state_) {
     case PumpState::UNKNOWN:
     case PumpState::IDLE:
+      // Quiescent. Nothing is timed; all relays stay inactive.
+      break;
+
     case PumpState::RUNNING_ASSUMED:
-      // Quiescent states. Nothing is timed; all relays stay inactive.
+      // Quiescent for timing purposes, but the valve stays OPEN for as long
+      // as the engine is assumed to be running.
+      break;
+
+    case PumpState::PRIMING:
+      if (elapsed >= VALVE_PRIME_MS) {
+        // Valve has been open long enough to prime; begin the start sequence.
+        setChokeRelay(true);
+        enterState(PumpState::CHOKING);
+      }
+      break;
+
+    case PumpState::VALVE_CLOSING:
+      if (elapsed >= VALVE_CLOSE_DELAY_MS) {
+        // The engine has had time to come to rest, so the intake can now be
+        // shut without starving a spinning pump of water.
+        setValveRelay(false);
+        enterState(PumpState::IDLE);
+      }
       break;
 
     case PumpState::CHOKING:
@@ -369,8 +575,14 @@ void PumpController::advance(uint32_t now) {
 
     case PumpState::STOPPING:
       if (elapsed >= KILL_HOLD_MS) {
-        setKillRelay(false);
-        enterState(PumpState::IDLE);
+        // The kill stays ASSERTED. With the fail-safe NC wiring that means K3
+        // stays de-energised and the kill wire stays grounded, which is the
+        // resting state for a stopped engine -- releasing it here would let
+        // the engine be pull-started or restarted unattended.
+        //
+        // Leaving STOPPING clears engineMayBeRunning(), which is what permits
+        // the intake to be shut once VALVE_CLOSE_DELAY_MS has also elapsed.
+        enterState(PumpState::VALVE_CLOSING);
       }
       break;
 
@@ -387,6 +599,9 @@ void PumpController::advance(uint32_t now) {
         faultKillActive_ = false;
         Serial.println(F("[FAULT] kill hold complete; awaiting operator reset"));
       }
+      // The valve is intentionally left as it is. Closing it is an operator
+      // decision made via /v1/stop or /v1/reset-idle, once they know the
+      // engine really has stopped.
       break;
   }
 }
@@ -398,9 +613,13 @@ void PumpController::tick(uint32_t now) {
 
 void PumpController::beginStopSequence() {
   // Order is mandated: starter off, choke off, then kill on.
+  //
+  // The valve is deliberately left OPEN here. It is closed only in
+  // VALVE_CLOSING, after the kill hold has expired and the engine has been
+  // given VALVE_CLOSE_DELAY_MS to come to rest -- never against a pump that
+  // could still be spinning.
   setStarterRelay(false);
   setChokeRelay(false);
-  setSpareRelay(false);
   setKillRelay(true);
   faultKillActive_ = false;
   fault_ = FaultCode::NONE;
@@ -420,11 +639,13 @@ EngineStatus PumpController::engineStatus() const {
     case PumpState::FAULT:           return EngineStatus::UNKNOWN_STATUS;
     case PumpState::IDLE:            return EngineStatus::STOPPED_ASSUMED;
     case PumpState::RETRY_WAIT:      return EngineStatus::STOPPED_ASSUMED;
+    case PumpState::PRIMING:         return EngineStatus::STOPPED_ASSUMED;
     case PumpState::CHOKING:         return EngineStatus::STOPPED_ASSUMED;
     case PumpState::CRANKING:        return EngineStatus::STARTING;
     case PumpState::UNCHOKING:       return EngineStatus::STARTING;
     case PumpState::RUNNING_ASSUMED: return EngineStatus::RUNNING_ASSUMED_STATUS;
     case PumpState::STOPPING:        return EngineStatus::STOPPING_STATUS;
+    case PumpState::VALVE_CLOSING:   return EngineStatus::STOPPING_STATUS;
   }
   return EngineStatus::UNKNOWN_STATUS;
 }
@@ -445,14 +666,24 @@ uint32_t PumpController::cooldownRemainingMs(uint32_t now) const {
 }
 
 bool PumpController::isQuiescent() const {
-  if (starterActive_ || chokeActive_ || killActive_ || spareActive_) {
+  // Quiescence means "no relay TIMING is pending", which is the only thing
+  // that makes a blocking Wi-Fi call dangerous.
+  //
+  // The kill and the valve are both deliberately excluded. With the fail-safe
+  // wiring the kill is ASSERTED at rest, so treating it as activity would
+  // mark IDLE as busy forever; and the valve stays open for the whole time
+  // the engine runs, which could be hours. Neither has a timing sequence of
+  // its own -- the states below are what carry those.
+  if (starterActive_ || chokeActive_) {
     return false;
   }
   switch (state_) {
+    case PumpState::PRIMING:
     case PumpState::CHOKING:
     case PumpState::CRANKING:
     case PumpState::UNCHOKING:
     case PumpState::STOPPING:
+    case PumpState::VALVE_CLOSING:
       return false;
     default:
       return true;
@@ -460,13 +691,25 @@ bool PumpController::isQuiescent() const {
 }
 
 bool PumpController::startPermitted(uint32_t now) const {
-  // Every relay must already be at rest. In normal operation IDLE always
-  // satisfies this, so the extra condition changes nothing -- but it closes
-  // the door on a START being layered on top of a manually driven relay left
-  // energised by the maintenance API.
-  return state_ == PumpState::IDLE &&
-         cooldownRemainingMs(now) == 0 &&
-         !starterActive_ && !chokeActive_ && !killActive_;
+  if (state_ != PumpState::IDLE || cooldownRemainingMs(now) != 0) {
+    return false;
+  }
+  // Water must be available before the engine is allowed to run at all.
+  if (!waterOk_) {
+    return false;
+  }
+  // The starter and choke must be at rest, and the kill must currently be
+  // asserted -- IDLE means "engine inhibited", so a released kill here would
+  // mean something has already permitted the engine to run.
+  if (starterActive_ || chokeActive_ || !killActive_) {
+    return false;
+  }
+  // The intake must be shut so the prime dwell is genuinely observed rather
+  // than inherited from an earlier run or a manual maintenance command.
+  if (INTAKE_VALVE_ENABLED && valveActive_) {
+    return false;
+  }
+  return true;
 }
 
 bool PumpController::maintenancePermitted() const {
@@ -505,6 +748,18 @@ bool PumpController::applyMaintenance(CommandType type) {
     case CommandType::MAINT_KILL_OFF:
       setKillRelay(false);
       return true;
+
+    case CommandType::MAINT_VALVE_ON:
+      setValveRelay(true);
+      return valveActive_;
+
+    case CommandType::MAINT_VALVE_OFF:
+      // Refused by the relay layer if the engine may be running. Maintenance
+      // is only permitted from IDLE/UNKNOWN anyway, so this should always
+      // succeed -- the check below is what makes that a guarantee, not a
+      // convention.
+      setValveRelay(false);
+      return !valveActive_;
 
     default:
       return false;
@@ -629,11 +884,26 @@ CommandResult PumpController::handleCommand(CommandType type,
       timings_ = (timings != nullptr) ? *timings : StartTimings();
       timings_.clamp();
 
-      // 1. kill open, 2. starter inactive, 3. choke on, 4. CHOKING.
-      setKillRelay(false);
+      // 1. kill open, 2. starter inactive, 3. valve OPEN to prime.
+      //
+      // The choke and starter come later: PRIMING holds the valve open for
+      // VALVE_PRIME_MS before advance() moves on to CHOKING. The starter is
+      // additionally gated on primeComplete() at the relay layer, so no path
+      // can crank an unprimed pump.
+      //
+      // The kill stays ASSERTED throughout priming. The engine is only
+      // permitted to run at the moment the starter is engaged, in advance().
       setStarterRelay(false);
-      setChokeRelay(true);
-      enterState(PumpState::CHOKING);
+      if (INTAKE_VALVE_ENABLED) {
+        setValveRelay(true);
+        enterState(PumpState::PRIMING);
+      } else {
+        // No electric intake valve: nothing to prime, so go straight to the
+        // choke. primeComplete() still gates the starter on the water
+        // interlock.
+        setChokeRelay(true);
+        enterState(PumpState::CHOKING);
+      }
       out.accepted = true;
       out.httpStatus = 202;
       break;
@@ -651,11 +921,19 @@ CommandResult PumpController::handleCommand(CommandType type,
       }
       setStarterRelay(false);
       setChokeRelay(false);
-      setKillRelay(false);
-      setSpareRelay(false);
+      // Assert the kill: the engine did not catch, and a magneto engine is
+      // only inhibited while K3 is de-energised.
+      setKillRelay(true);
+      // The engine did not catch, so there is nothing to deadhead: shut the
+      // valve. A later retry therefore re-primes from scratch rather than
+      // inheriting a stale prime.
+      //
+      // enterState() first so engineMayBeRunning() is already false; the
+      // relay layer would otherwise refuse the close from RUNNING_ASSUMED.
+      enterState(PumpState::RETRY_WAIT);
+      setValveRelay(false);
       // RETRY_WAIT holds until the minimum starter interval has elapsed and
       // then falls back to IDLE. No automatic retry is ever initiated.
-      enterState(PumpState::RETRY_WAIT);
       out.accepted = true;
       out.httpStatus = 202;
       break;
@@ -671,7 +949,6 @@ CommandResult PumpController::handleCommand(CommandType type,
         out.httpStatus = 409;
         break;
       }
-      allRelaysInactive();
       fault_ = FaultCode::NONE;
       faultKillActive_ = false;
       // The operator asserts the engine is stopped; the controller still
@@ -681,6 +958,10 @@ CommandResult PumpController::handleCommand(CommandType type,
       } else {
         enterState(PumpState::IDLE);
       }
+      // After the state change, so engineMayBeRunning() is false and the
+      // valve close is permitted. The operator has asserted the engine is
+      // stopped, which is exactly the assertion the interlock needs.
+      toSafeState();
       out.accepted = true;
       out.httpStatus = 202;
       break;
@@ -691,7 +972,9 @@ CommandResult PumpController::handleCommand(CommandType type,
     case CommandType::MAINT_STARTER_ON:
     case CommandType::MAINT_STARTER_OFF:
     case CommandType::MAINT_KILL_ON:
-    case CommandType::MAINT_KILL_OFF: {
+    case CommandType::MAINT_KILL_OFF:
+    case CommandType::MAINT_VALVE_ON:
+    case CommandType::MAINT_VALVE_OFF: {
       if (!maintenancePermitted()) {
         out.accepted = false;
         out.httpStatus = 409;

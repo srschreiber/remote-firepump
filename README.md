@@ -106,8 +106,9 @@ board. Nothing else is attached to the Arduino.
 | `GND`               | `GND`        | Shared control-side ground |
 | Digital `D2`        | `IN1`        | K1 starter command         |
 | Digital `D3`        | `IN2`        | K2 choke command           |
-| Digital `D4`        | `IN3`        | K3 stop/kill command       |
-| Digital `D5`        | `IN4`        | K4 spare; always inactive  |
+| Digital `D4`        | `IN3`        | K3 **run-enable** (NC contact — energise to permit running) |
+| Digital `D5`        | `IN4`        | K4 intake valve command    |
+| Digital `D6`        | —            | Water-available interlock **input** (switch to `GND`) |
 
 `D3` and `D5` are PWM-capable but are used strictly as plain digital outputs.
 There is no `analogWrite()` anywhere in this firmware.
@@ -164,24 +165,90 @@ K2 is inactive the trigger is removed and the actuator returns to unchoked.
 > If your actuator latches the opposite way, the start sequence will choke at
 > the wrong time.
 
-#### K3 — stop/kill
+#### K3 — run-enable (fail-safe, uses the NC contact)
 
-Imitates turning the engine **OFF** by grounding the Honda ignition-kill
-circuit.
+**Wire this to `NC`, not `NO`.** This is the single most important wiring
+detail in the project; see the [power-loss note](#️-power-loss-does-not-stop-a-gx390--this-drove-the-k3-design).
 
 | Terminal | Connection |
 | -------- | ---------- |
 | `COM`    | Verified Honda ignition-kill wire |
-| `NO`     | Engine ground |
+| `NC`     | Engine ground |
+| `NO`     | Unused |
+
+| Relay state | NC contact | Kill wire | Engine |
+| --- | --- | --- | --- |
+| **De-energised** (resting, power loss, reset) | closed | grounded | **cannot run** |
+| **Energised** (firmware permits running) | open | floating | may run |
+
+So the firmware must actively hold K3 energised for the whole time the engine
+runs, and simply letting go stops it. **Never inject 12 V into the kill wire.**
+
+#### K4 — intake valve
+
+A 2" **normally-closed** 12 V solenoid valve on the pump **intake**.
+De-energised = shut, so it shuts at power-on and on any power loss.
+
+| Terminal | Connection |
+| -------- | ---------- |
+| `COM`    | Appropriately fused +12 V |
+| `NO`     | Valve solenoid + |
 | `NC`     | Unused |
 
-Activating K3 closes `COM`→`NO` and grounds the kill wire.
-**Never inject 12 V into the kill wire.**
+The valve solenoid's negative returns to battery negative. A 2" valve can draw
+1–2 A continuously while held open, so fuse it on its own feed and size the
+wiring for continuous duty — it stays energised for the entire run.
 
-#### K4 — spare
+**Optional.** Set `ENABLE_INTAKE_VALVE 0` in `config.h` to delete it entirely;
+see the next section for why you might want to.
 
-Unused. The firmware holds it permanently inactive and raises a `SPARE_ACTIVE`
-fault if it is ever found otherwise.
+### Intake valve and water interlock
+
+An electrically operated **intake** valve is the most dangerous part of this
+design. If it closes while the engine runs, the pump loses water and runs dry.
+The water is what lubricates and cools the mechanical seal, and Honda warn that
+extended dry running destroys it.
+
+**Software cannot protect against this.** A broken valve wire, a blown valve
+fuse or a mechanically stuck valve all produce a shut intake that the firmware
+has no way to detect or correct. By the time anything could notice, the seal is
+already going.
+
+#### Option A — delete the electric valve (simpler, more reliable)
+
+If the tank line can safely stay pressurised, leave a **manual intake valve
+permanently open** and fit a **foot/check valve** to retain prime. Then:
+
+```cpp
+#define ENABLE_INTAKE_VALVE 0
+```
+
+K4 goes unused and an entire class of failure disappears. This is the
+recommended option where the plumbing allows it.
+
+#### Option B — keep the valve, and treat the water interlock as REQUIRED
+
+With `ENABLE_INTAKE_VALVE 1`, a water pressure/flow switch on the intake is
+**mandatory, not optional**. A compile-time assertion enforces this:
+
+```
+An electrically operated intake valve without a water interlock can run the
+pump dry and destroy the seal. Either fit the interlock
+(REQUIRE_WATER_INTERLOCK=1) or delete the electric valve
+(ENABLE_INTAKE_VALVE=0).
+```
+
+**Wire the switch so it grounds the ignition-kill wire directly** — in parallel
+with K3's NC contact — so that losing water stops the engine even if this
+Arduino is dead, hung or unplugged. That hardwired path is the real protection.
+
+`D6` is a **second, independent** layer: the firmware reads the same switch so
+it can refuse to start, report `water_ok` over the API, and shut down in an
+orderly way. `INPUT_PULLUP` means a broken wire reads as "no water", so sensor
+wiring failures fail safe. The reading is debounced (`WATER_DEBOUNCE_MS`) so a
+pressure switch chattering at its setpoint cannot trip a running fire pump, and
+a startup grace (`WATER_STARTUP_GRACE_MS`) allows the pump time to build
+pressure after a crank.
 
 ### Run mode
 
@@ -215,10 +282,32 @@ The Arduino's regulated `5V` pin then powers the relay module control side
 The Raspberry Pi is indoors on its own supply and does **not** power the
 Arduino.
 
-**Loss of Arduino power de-energises every relay.** That is the intended
-fail-safe: no relay is ever held active without firmware actively driving it.
-After any reboot the firmware makes **no assumption** about whether the engine
-is running — it starts in `UNKNOWN`.
+### ⚠️ Power loss does NOT stop a GX390 — this drove the K3 design
+
+A GX390's magneto ignition is **independent of the battery and the electric
+starter**. Cutting controller power does not stop a running engine.
+
+An earlier revision of this firmware wired K3 to its `NO` contact ("energise to
+stop") and documented power loss as the fail-safe. **That was wrong**, and with
+a fail-closed intake valve it produced the worst possible outcome:
+
+| On power loss (old, wrong design) | Result |
+| --- | --- |
+| K3 de-energises, `NO` opens | kill wire floats → **engine keeps running** |
+| K4 de-energises, NC valve shuts | **intake closes** |
+| | → pump runs dry → **mechanical seal destroyed** |
+
+K3 is now wired to its **`NC` contact** and must be held **energised** for the
+engine to be permitted to run. Power loss, a watchdog reset, a blown 5 V rail
+or a snapped `IN3` wire all ground the kill wire and stop the engine.
+
+After any reboot the firmware still makes **no assumption** about whether the
+engine is running — it starts in `UNKNOWN`, with the kill asserted.
+
+> Even so, software cannot cover a broken valve wire, a blown valve fuse or a
+> mechanically stuck valve. **The hardwired water interlock is mandatory** when
+> the electric intake valve is fitted. See
+> [Intake valve and water interlock](#intake-valve-and-water-interlock).
 
 ### Relay polarity
 

@@ -290,6 +290,8 @@ Route resolveRoute(HttpMethod method, const char* path) {
       {"/v1/maintenance/starter/off", HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_STARTER_OFF},
       {"/v1/maintenance/kill/on",     HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_KILL_ON},
       {"/v1/maintenance/kill/off",    HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_KILL_OFF},
+      {"/v1/maintenance/valve/on",    HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_VALVE_ON},
+      {"/v1/maintenance/valve/off",   HttpMethod::POST, RouteAction::COMMAND, CommandType::MAINT_VALVE_OFF},
   };
 
   Route r;
@@ -474,11 +476,13 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       "\"uptime_ms\":%lu,"
       "\"engine_status\":\"%s\","
       "\"running_confirmed\":%s,"
-      "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"spare\":%s},"
+      "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"valve\":%s},"
+      "\"water_ok\":%s,\"intake_valve_enabled\":%s,"
       "\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi_dbm\":%ld},"
       "\"cooldown_remaining_ms\":%lu,"
-      "\"timings\":{\"choke_prep_ms\":%lu,\"crank_ms\":%lu,"
-      "\"unchoke_delay_ms\":%lu,\"kill_hold_ms\":%lu,"
+      "\"timings\":{\"valve_prime_ms\":%lu,\"choke_prep_ms\":%lu,"
+      "\"crank_ms\":%lu,\"unchoke_delay_ms\":%lu,\"kill_hold_ms\":%lu,"
+      "\"valve_close_delay_ms\":%lu,"
       "\"min_recrank_gap_ms\":%lu,\"max_crank_ms\":%lu},"
       "\"maintenance_api\":%s,"
       "\"last_command\":%s,"
@@ -488,13 +492,16 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       static_cast<unsigned long>(v.stateElapsedMs),
       static_cast<unsigned long>(v.uptimeMs),
       v.engineStatus, jsonBool(v.runningConfirmed),
-      jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.spare),
+      jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.valve),
+      jsonBool(v.waterOk), jsonBool(v.valveEnabled),
       jsonBool(v.wifiConnected), v.ip, static_cast<long>(v.rssiDbm),
       static_cast<unsigned long>(v.cooldownRemainingMs),
+      static_cast<unsigned long>(VALVE_PRIME_MS),
       static_cast<unsigned long>(v.chokePrepMs),
       static_cast<unsigned long>(v.crankMs),
       static_cast<unsigned long>(v.unchokeDelayMs),
       static_cast<unsigned long>(KILL_HOLD_MS),
+      static_cast<unsigned long>(VALVE_CLOSE_DELAY_MS),
       static_cast<unsigned long>(MIN_RECRANK_GAP_MS),
       static_cast<unsigned long>(MAX_CRANK_MS),
       jsonBool(MAINTENANCE_API_ENABLED),

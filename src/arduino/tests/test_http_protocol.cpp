@@ -433,7 +433,7 @@ TEST(status_json_contains_every_documented_field) {
   CHECK_CONTAINS(j, "\"engine_status\":\"STOPPED_ASSUMED\"");
   CHECK_CONTAINS(j, "\"running_confirmed\":false");
   CHECK_CONTAINS(j, "\"relay_outputs\":{\"starter\":false,\"choke\":false,"
-                    "\"kill\":false,\"spare\":false}");
+                    "\"kill\":false,\"valve\":false}");
   CHECK_CONTAINS(j, "\"wifi\":{\"connected\":true,\"ip\":\"192.168.1.50\","
                     "\"rssi_dbm\":-57}");
   CHECK_CONTAINS(j, "\"cooldown_remaining_ms\":0");
@@ -449,7 +449,7 @@ TEST(status_json_renders_relay_and_fault_variations) {
   v.starter = true;
   v.choke = true;
   v.kill = true;
-  v.spare = true;
+  v.valve = true;
   v.fault = "STARTER_OVERRUN";
   v.hasLastCommand = false;
   v.wifiConnected = false;
@@ -458,7 +458,7 @@ TEST(status_json_renders_relay_and_fault_variations) {
   char buf[HTTP_BODY_MAX];
   CHECK(buildStatusJson(buf, sizeof(buf), v) > 0);
   const std::string j(buf);
-  CHECK_CONTAINS(j, "\"starter\":true,\"choke\":true,\"kill\":true,\"spare\":true");
+  CHECK_CONTAINS(j, "\"starter\":true,\"choke\":true,\"kill\":true,\"valve\":true");
   CHECK_CONTAINS(j, "\"fault\":\"STARTER_OVERRUN\"");
   CHECK_CONTAINS(j, "\"last_command\":null");
   CHECK_CONTAINS(j, "\"connected\":false");
@@ -474,7 +474,7 @@ TEST(status_json_fits_the_response_buffer_at_maximum_size) {
   v.stateElapsedMs = 0xFFFFFFFFu;
   v.uptimeMs = 0xFFFFFFFFu;
   v.engineStatus = "RUNNING_ASSUMED";
-  v.starter = true; v.choke = true; v.kill = true; v.spare = true;
+  v.starter = true; v.choke = true; v.kill = true; v.valve = true;
   v.wifiConnected = true;
   v.ip = "255.255.255.255";
   v.rssiDbm = -100;

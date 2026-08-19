@@ -174,7 +174,9 @@ struct StatusView {
   bool starter = false;
   bool choke = false;
   bool kill = false;
-  bool spare = false;
+  bool valve = false;   // K4: true means the NC intake valve is OPEN
+  bool valveEnabled = INTAKE_VALVE_ENABLED;
+  bool waterOk = false; // debounced water-available interlock
 
   bool        wifiConnected = false;
   const char* ip = "0.0.0.0";

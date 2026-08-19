@@ -104,9 +104,10 @@ int starterActivationCount() {
 }
 
 const PumpState kAllStates[] = {
-    PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::CHOKING,
-    PumpState::CRANKING,  PumpState::UNCHOKING,   PumpState::RUNNING_ASSUMED,
-    PumpState::STOPPING,  PumpState::RETRY_WAIT,  PumpState::FAULT,
+    PumpState::UNKNOWN,   PumpState::IDLE,        PumpState::PRIMING,
+    PumpState::CHOKING,   PumpState::CRANKING,    PumpState::UNCHOKING,
+    PumpState::RUNNING_ASSUMED, PumpState::STOPPING, PumpState::VALVE_CLOSING,
+    PumpState::RETRY_WAIT, PumpState::FAULT,
 };
 
 }  // namespace
@@ -122,8 +123,8 @@ TEST(boot_starts_in_unknown_with_all_relays_inactive) {
   CHECK_STREQ(toString(p.state()), "UNKNOWN");
   CHECK(!p.starterActive());
   CHECK(!p.chokeActive());
-  CHECK(!p.killActive());
-  CHECK(!p.spareActive());
+  CHECK_MSG(p.killActive(), "boot must inhibit the engine (fail-safe NC kill)");
+  CHECK(!p.valveActive());
   checkRelayPins(p, "boot");
   CHECK(!p.runningConfirmed());
   CHECK(toString(p.fault()) == nullptr);
@@ -134,7 +135,7 @@ TEST(boot_drives_every_pin_inactive_before_enabling_it_as_output) {
   bootAt(p, 12345);
 
   const uint8_t pins[] = {PIN_RELAY_STARTER, PIN_RELAY_CHOKE, PIN_RELAY_KILL,
-                          PIN_RELAY_SPARE};
+                          PIN_RELAY_VALVE};
   for (uint8_t pin : pins) {
     // At least one digitalWrite must precede pinMode(OUTPUT) so the output
     // data register already holds the safe level when the pin starts driving.
@@ -208,7 +209,7 @@ TEST(start_is_rejected_from_idle_while_recrank_cooldown_is_outstanding) {
   // STOP returns to IDLE after KILL_HOLD_MS, which is shorter than the
   // recrank gap, so IDLE is reached with cooldown still running.
   p.handleCommand(CommandType::STOP, "stop-1", fake::nowMs);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   CHECK_STREQ(toString(p.state()), "IDLE");
   CHECK(p.cooldownRemainingMs(fake::nowMs) > 0);
 
@@ -237,12 +238,26 @@ TEST(start_sequence_follows_choke_crank_release_unchoke_with_exact_timings) {
   const CommandResult r = p.handleCommand(CommandType::START, "run-1", fake::nowMs);
   CHECK(r.accepted);
   CHECK_EQ(r.httpStatus, 202);
-  CHECK_STREQ(toString(r.state), "CHOKING");
 
-  // Step 3/4: choke engaged, starter and kill open.
+  if (INTAKE_VALVE_ENABLED) {
+    // Step 1/2: intake opens and the pump primes. The kill stays ASSERTED
+    // throughout -- the engine is not permitted to run until it is cranked.
+    CHECK_STREQ(toString(r.state), "PRIMING");
+    CHECK(p.valveActive());
+    CHECK(!p.chokeActive());
+    CHECK_MSG(p.killActive(), "the kill was released during priming");
+    checkRelayPins(p, "PRIMING");
+
+    advanceBy(p, VALVE_PRIME_MS - 1);
+    CHECK_STREQ(toString(p.state()), "PRIMING");
+    advanceBy(p, 1);
+  }
+
+  // Step 3/4: choke engaged, starter still open, kill still asserted.
+  CHECK_STREQ(toString(p.state()), "CHOKING");
   CHECK(p.chokeActive());
   CHECK(!p.starterActive());
-  CHECK(!p.killActive());
+  CHECK_MSG(p.killActive(), "the kill was released before cranking");
   checkRelayPins(p, "CHOKING");
 
   // Still choking one millisecond before the prep time elapses.
@@ -255,7 +270,7 @@ TEST(start_sequence_follows_choke_crank_release_unchoke_with_exact_timings) {
   CHECK_STREQ(toString(p.state()), "CRANKING");
   CHECK(p.starterActive());
   CHECK(p.chokeActive());
-  CHECK(!p.killActive());
+  CHECK_MSG(!p.killActive(), "cranking with the kill still asserted");
   checkRelayPins(p, "CRANKING");
 
   advanceBy(p, CRANK_DURATION_MS - 1);
@@ -284,7 +299,7 @@ TEST(start_sequence_follows_choke_crank_release_unchoke_with_exact_timings) {
   // Measured from the pin event log, not from internal bookkeeping.
   CHECK_EQ(starterActiveTotalMs(), CRANK_DURATION_MS);
   CHECK_EQ(starterActivationCount(), 1);
-  checkSpareNeverActive("start sequence");
+  checkStarterNeverCrankedWithKillAsserted("start sequence");
 
   // No sensor exists, so the engine is never reported as confirmed running.
   CHECK(!p.runningConfirmed());
@@ -341,10 +356,12 @@ TEST(stop_is_accepted_from_every_state) {
     CHECK(p.killActive());
 
     advanceBy(p, 1);
+    CHECK_STREQ(toString(p.state()), "VALVE_CLOSING");
+    advanceBy(p, VALVE_CLOSE_DELAY_MS);
     CHECK_STREQ(toString(p.state()), "IDLE");
-    CHECK(!p.killActive());
+    CHECK_MSG(p.killActive(), "the kill must stay asserted at rest");
     checkRelayPins(p, "after kill hold");
-    checkSpareNeverActive("stop from state");
+    checkStarterNeverCrankedWithKillAsserted("stop from state");
   }
 }
 
@@ -368,7 +385,7 @@ TEST(stop_during_cranking_releases_starter_before_grounding_kill) {
         starterOffIdx == SIZE_MAX) {
       starterOffIdx = i;
     }
-    if (e.pin == PIN_RELAY_KILL && e.value == activeLevel() &&
+    if (e.pin == PIN_RELAY_KILL && e.value == killPinLevelFor(true) &&
         killOnIdx == SIZE_MAX) {
       killOnIdx = i;
     }
@@ -394,7 +411,7 @@ TEST(stop_during_choking_cancels_choke_and_grounds_kill) {
   CHECK(p.killActive());
   CHECK_STREQ(toString(p.state()), "STOPPING");
   CHECK_EQ(fake::pinLevel[PIN_RELAY_CHOKE], inactiveLevel());
-  CHECK_EQ(fake::pinLevel[PIN_RELAY_KILL], activeLevel());
+  CHECK_EQ(fake::pinLevel[PIN_RELAY_KILL], killPinLevelFor(true));
 
   // The starter never engaged at all on this path.
   CHECK_EQ(starterActivationCount(), 0);
@@ -409,10 +426,10 @@ TEST(stop_from_running_assumed_holds_kill_for_the_configured_duration) {
   p.handleCommand(CommandType::STOP, "stop-run", fake::nowMs);
   CHECK(p.killActive());
 
-  advanceBy(p, KILL_HOLD_MS);
-  CHECK(!p.killActive());
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
+  CHECK_MSG(p.killActive(), "the kill must stay asserted at rest");
   CHECK_STREQ(toString(p.state()), "IDLE");
-  CHECK_EQ(static_cast<uint32_t>(fake::nowMs - t0), KILL_HOLD_MS);
+  CHECK_EQ(static_cast<uint32_t>(fake::nowMs - t0), KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
 }
 
 TEST(repeated_stop_extends_the_kill_hold_rather_than_shortening_it) {
@@ -428,7 +445,8 @@ TEST(repeated_stop_extends_the_kill_hold_rather_than_shortening_it) {
   advanceBy(p, KILL_HOLD_MS - 1);
   CHECK_MSG(p.killActive(), "second STOP shortened the kill hold");
   advanceBy(p, 1);
-  CHECK(!p.killActive());
+  CHECK_STREQ(toString(p.state()), "VALVE_CLOSING");
+  advanceBy(p, VALVE_CLOSE_DELAY_MS);
   CHECK_STREQ(toString(p.state()), "IDLE");
 }
 
@@ -441,7 +459,7 @@ TEST(stop_clears_a_fault_and_returns_to_idle) {
   const CommandResult r = p.handleCommand(CommandType::STOP, "stop-fault", fake::nowMs);
   CHECK(r.accepted);
   CHECK(toString(p.fault()) == nullptr);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   CHECK_STREQ(toString(p.state()), "IDLE");
 }
 
@@ -463,7 +481,7 @@ TEST(start_failed_enters_retry_wait_and_falls_back_to_idle) {
   // All three relays inactive.
   CHECK(!p.starterActive());
   CHECK(!p.chokeActive());
-  CHECK(!p.killActive());
+  CHECK_MSG(p.killActive(), "the kill must stay asserted in RETRY_WAIT");
   checkRelayPins(p, "RETRY_WAIT");
 
   const uint32_t remaining = p.cooldownRemainingMs(fake::nowMs);
@@ -529,7 +547,7 @@ TEST(reset_idle_moves_unknown_to_idle_and_deactivates_all_relays) {
   CHECK_STREQ(toString(p.state()), "IDLE");
   CHECK(!p.starterActive());
   CHECK(!p.chokeActive());
-  CHECK(!p.killActive());
+  CHECK_MSG(p.killActive(), "reset-idle must leave the engine inhibited");
   checkRelayPins(p, "after reset-idle");
   CHECK_STREQ(toString(p.engineStatus()), "STOPPED_ASSUMED");
 }
@@ -562,7 +580,7 @@ TEST(reset_idle_clears_a_fault) {
   CHECK(toString(p.fault()) != nullptr);
 
   // Wait out the fault kill hold so the relays are quiet first.
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   CHECK(!p.killActive());
 
   const CommandResult r =
@@ -717,7 +735,7 @@ TEST(relay_layer_releases_the_starter_before_grounding_kill) {
     const fake::Event& e = fake::events[i];
     if (e.kind != fake::EventKind::DIGITAL_WRITE) continue;
     if (e.pin == PIN_RELAY_STARTER && e.value == inactiveLevel() && starterOff == SIZE_MAX) starterOff = i;
-    if (e.pin == PIN_RELAY_KILL && e.value == activeLevel() && killOn == SIZE_MAX) killOn = i;
+    if (e.pin == PIN_RELAY_KILL && e.value == killPinLevelFor(true) && killOn == SIZE_MAX) killOn = i;
   }
   CHECK(starterOff != SIZE_MAX && killOn != SIZE_MAX);
   CHECK_MSG(starterOff < killOn, "kill closed before the starter opened");
@@ -740,28 +758,42 @@ TEST(simultaneous_starter_and_kill_flags_are_caught_and_faulted) {
   CHECK_STREQ(toString(p.fault()), "STARTER_KILL_CONFLICT");
 }
 
-TEST(spare_relay_activation_is_caught_and_faulted) {
+TEST(a_starter_found_running_with_the_intake_shut_is_caught_and_faulted) {
+  // K4 used to be an always-inactive spare; it is now the intake valve, so
+  // the invariant it carries is the reverse: the starter must never be found
+  // energised while the intake is shut.
   PumpController p;
   bootAt(p, 0);
   driveToState(p, PumpState::IDLE);
 
-  PumpTestAccess::corruptSpareFlag(p);
+  // Corrupt the internal picture the way a wild write or a logic bug might.
+  PumpTestAccess::corruptStarterFlag(p, true);
+  PumpTestAccess::corruptValveFlag(p, false);
+  PumpTestAccess::corruptKillFlag(p, false);
   tickAt(p, fake::nowMs + 1);
 
-  CHECK(!p.spareActive());
-  CHECK_EQ(fake::pinLevel[PIN_RELAY_SPARE], inactiveLevel());
+  CHECK_MSG(!p.starterActive(), "starter left running with the intake shut");
+  CHECK_EQ(fake::pinLevel[PIN_RELAY_STARTER], inactiveLevel());
   CHECK_STREQ(toString(p.state()), "FAULT");
-  CHECK_STREQ(toString(p.fault()), "SPARE_ACTIVE");
+  CHECK_STREQ(toString(p.fault()), "VALVE_CLOSED_WHILE_RUNNING");
 }
 
-TEST(spare_relay_cannot_be_commanded_active_through_the_relay_layer) {
+TEST(an_intake_found_shut_with_the_engine_running_is_reopened_and_faulted) {
+  if (!INTAKE_VALVE_ENABLED) return;
+
   PumpController p;
   bootAt(p, 0);
-  PumpTestAccess::setNow(p, fake::nowMs);
-  PumpTestAccess::setSpare(p, true);   // deliberately asks for active
-  CHECK_MSG(!p.spareActive(), "K4 accepted an activation request");
-  CHECK_EQ(fake::pinLevel[PIN_RELAY_SPARE], inactiveLevel());
-  checkSpareNeverActive("explicit spare activation attempt");
+  driveToState(p, PumpState::RUNNING_ASSUMED);
+  CHECK(p.valveActive());
+
+  // Pretend the valve flag was corrupted to "shut" while the engine runs.
+  PumpTestAccess::corruptValveFlag(p, false);
+  tickAt(p, fake::nowMs + 1);
+
+  CHECK_MSG(p.valveActive(),
+            "the intake was left shut while the engine could be running");
+  CHECK_EQ(fake::pinLevel[PIN_RELAY_VALVE], activeLevel());
+  CHECK_STREQ(toString(p.fault()), "VALVE_CLOSED_WHILE_RUNNING");
 }
 
 TEST(fault_entered_while_engine_may_be_running_grounds_kill_then_releases) {
@@ -775,7 +807,7 @@ TEST(fault_entered_while_engine_may_be_running_grounds_kill_then_releases) {
   CHECK(!p.starterActive());
   CHECK(!p.chokeActive());
 
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   CHECK_MSG(!p.killActive(), "fault kill hold never released");
   CHECK_STREQ(toString(p.state()), "FAULT");   // stays until an operator resets
 }
@@ -813,13 +845,18 @@ TEST(quiescence_is_false_during_every_timed_sequence) {
   }
 }
 
-TEST(quiescence_is_false_while_a_fault_kill_hold_is_running) {
+TEST(fault_is_quiescent_because_it_has_no_pending_relay_timing) {
+  // Quiescence gates blocking Wi-Fi calls, and its only question is whether a
+  // relay TIMING sequence is pending. FAULT has none: the starter and choke
+  // are shed on entry and the kill is simply held asserted. Treating the
+  // asserted kill as "activity" would block reconnection indefinitely, since
+  // asserted is now its resting position.
   PumpController p;
   bootAt(p, 0);
   driveToState(p, PumpState::FAULT);
-  CHECK_MSG(!p.isQuiescent(), "quiescent while the fault kill relay was closed");
-  advanceBy(p, KILL_HOLD_MS);
-  CHECK(p.isQuiescent());
+  CHECK(!p.starterActive());
+  CHECK(!p.chokeActive());
+  CHECK_MSG(p.isQuiescent(), "FAULT reported busy with no timing pending");
 }
 
 // ===========================================================================
@@ -837,6 +874,7 @@ TEST(duplicate_request_id_does_not_crank_the_engine_twice) {
 
   // The Pi retries because it never saw the response.
   const CommandResult b = p.handleCommand(CommandType::START, "start-001", fake::nowMs);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
   CHECK_MSG(b.duplicate, "replayed request was not flagged as a duplicate");
   CHECK(b.accepted);
   CHECK_STREQ(toString(p.state()), "CHOKING");
@@ -866,7 +904,7 @@ TEST(duplicate_suppression_never_blocks_a_stop) {
   driveToState(p, PumpState::RUNNING_ASSUMED);
 
   p.handleCommand(CommandType::STOP, "stop-x", fake::nowMs);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   CHECK_STREQ(toString(p.state()), "IDLE");
 
   // A replayed STOP is *labelled* a duplicate but is still executed. Skipping
@@ -877,7 +915,7 @@ TEST(duplicate_suppression_never_blocks_a_stop) {
   CHECK_MSG(p.killActive(), "a replayed STOP was silently swallowed");
   CHECK_STREQ(toString(p.state()), "STOPPING");
 
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   const CommandResult fresh = p.handleCommand(CommandType::STOP, "stop-y", fake::nowMs);
   CHECK(!fresh.duplicate);
   CHECK(fresh.accepted);
@@ -892,10 +930,11 @@ TEST(a_stale_stop_id_still_stops_an_engine_that_was_restarted_since) {
   driveToState(p, PumpState::IDLE);
 
   p.handleCommand(CommandType::STOP, "stop-1", fake::nowMs);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   advanceBy(p, MIN_RECRANK_GAP_MS);
 
   p.handleCommand(CommandType::START, "start-2", fake::nowMs);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
   advanceBy(p, CHOKE_PREP_MS);
   CHECK_STREQ(toString(p.state()), "CRANKING");
   CHECK(p.starterActive());
@@ -919,7 +958,7 @@ TEST(a_replayed_stop_does_not_evict_the_idempotency_history) {
   // Hammer one STOP ID far more times than the ring has slots.
   for (int i = 0; i < 50; ++i) {
     p.handleCommand(CommandType::STOP, "stop-spam", fake::nowMs);
-    advanceBy(p, KILL_HOLD_MS);
+    advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   }
 
   // The START ID must still be remembered.
@@ -942,7 +981,7 @@ TEST(idempotency_buffer_is_bounded_to_eight_entries) {
     const CommandResult r = p.handleCommand(CommandType::STOP, id, fake::nowMs);
     CHECK(r.accepted);
     CHECK(!r.duplicate);
-    advanceBy(p, KILL_HOLD_MS);
+    advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
   }
 
   CHECK_EQ(PumpTestAccess::recordSlotsUsed(p), IDEMPOTENCY_SLOTS);
@@ -979,7 +1018,7 @@ TEST(commands_without_a_request_id_are_never_deduplicated) {
   const CommandResult a = p.handleCommand(CommandType::STOP, "", fake::nowMs);
   CHECK(a.accepted);
   CHECK(!a.duplicate);
-  advanceBy(p, KILL_HOLD_MS);
+  advanceBy(p, KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS);
 
   const CommandResult b = p.handleCommand(CommandType::STOP, "", fake::nowMs);
   CHECK(!b.duplicate);
@@ -1025,7 +1064,7 @@ TEST(start_failed_from_idle_is_accepted_and_is_a_safe_no_op) {
   CHECK_EQ(r.cooldownRemainingMs, 0u);
   CHECK(!p.starterActive());
   CHECK(!p.chokeActive());
-  CHECK(!p.killActive());
+  CHECK_MSG(p.killActive(), "start-failed must leave the engine inhibited");
 
   tickAt(p, fake::nowMs);
   CHECK_STREQ(toString(p.state()), "IDLE");
@@ -1057,6 +1096,7 @@ TEST(full_start_sequence_is_correct_across_a_millis_rollover) {
   driveToState(p, PumpState::IDLE);
 
   p.handleCommand(CommandType::START, "roll-1", fake::nowMs);
+  if (INTAKE_VALVE_ENABLED) advanceBy(p, VALVE_PRIME_MS);
   CHECK_STREQ(toString(p.state()), "CHOKING");
 
   advanceBy(p, CHOKE_PREP_MS - 1);
@@ -1086,8 +1126,10 @@ TEST(stop_and_cooldown_are_correct_across_a_millis_rollover) {
   advanceBy(p, KILL_HOLD_MS - 1);
   CHECK(p.killActive());
   advanceBy(p, 1);
-  CHECK(!p.killActive());
+  CHECK_STREQ(toString(p.state()), "VALVE_CLOSING");
+  advanceBy(p, VALVE_CLOSE_DELAY_MS);
   CHECK_STREQ(toString(p.state()), "IDLE");
+  CHECK_MSG(p.killActive(), "the kill must stay asserted at rest");
 
   // Cooldown must still decrease monotonically to zero over the wrap.
   uint32_t prev = p.cooldownRemainingMs(fake::nowMs);

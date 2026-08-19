@@ -218,8 +218,11 @@ Look lookFor(PumpState state) {
     case PumpState::IDLE:            return {FLAME_SMALL,  SMALL_COUNT,  180};
     case PumpState::RETRY_WAIT:      return {FLAME_SMALL,  SMALL_COUNT,  140};
 
+    // Priming: intake open, water moving, engine not yet permitted to run.
+    case PumpState::PRIMING:         return {FLAME_SMALL,  SMALL_COUNT,  110};
     case PumpState::CHOKING:         return {FLAME_MEDIUM, MEDIUM_COUNT, 120};
     case PumpState::STOPPING:        return {FLAME_MEDIUM, MEDIUM_COUNT, 110};
+    case PumpState::VALVE_CLOSING:   return {FLAME_SMALL,  SMALL_COUNT,  130};
 
     case PumpState::CRANKING:        return {FLAME_LARGE,  LARGE_COUNT,   65};
     case PumpState::UNCHOKING:       return {FLAME_LARGE,  LARGE_COUNT,   85};
