@@ -6,9 +6,20 @@
 
 #include <string.h>
 
+#include "fault_handler.h"
 #include "net_manager.h"
 
 namespace {
+
+// Recurses with a real frame each time so the optimiser cannot turn this
+// into a loop. Used only by the fault-injection command.
+__attribute__((noinline)) uint32_t blowStack(uint32_t depth) {
+  volatile uint32_t pad[64];
+  for (size_t i = 0; i < 64; ++i) {
+    pad[i] = depth + i;
+  }
+  return pad[depth % 64] + blowStack(depth + 1);
+}
 
 // Case-insensitive whole-token compare.
 bool tokenIs(const char* tok, const char* literal) {
@@ -49,6 +60,8 @@ void SerialConsole::printHelp() const {
   Serial.println(F("  stop              stop now, from any state"));
   Serial.println(F("  failed            report that the start did not work"));
   Serial.println(F("  reset             confirm engine stopped -> IDLE"));
+  Serial.println(F("  fault <kind>      INJECT A FAULT and verify recovery:"));
+  Serial.println(F("                      div0 | null | stack | hang | trap"));
 }
 
 void SerialConsole::printStatus(const PumpController& pump,
@@ -98,6 +111,62 @@ void SerialConsole::printStatus(const PumpController& pump,
   const char* fault = toString(pump.fault());
   Serial.print(F("fault="));
   Serial.println(fault != nullptr ? fault : "none");
+}
+
+// Deliberate fault injection, so the recovery path can be exercised on real
+// hardware rather than argued about. Bench console only.
+void SerialConsole::injectFault(const char* kind, PumpController& pump,
+                                uint32_t now) {
+  (void)pump;
+  (void)now;
+  if (kind == nullptr || *kind == 0) {
+    Serial.println(F("-> usage: fault div0|null|stack|hang|trap"));
+    return;
+  }
+
+  Serial.print(F("INJECTING FAULT: "));
+  Serial.println(kind);
+  Serial.println(F("expect an immediate reset and a fresh boot banner"));
+  Serial.flush();
+
+  if (tokenIs(kind, "div0")) {
+    // Integer divide by zero. Only faults when DIV_0_TRP is enabled;
+    // otherwise the CPU returns 0 and this prints a suspicious result.
+    volatile int zero = 0;
+    volatile int boom = 42 / zero;
+    Serial.print(F("-> NO FAULT: 42/0 returned "));
+    Serial.println(boom);
+    Serial.println(F("   (DIV_0_TRP is not enabled)"));
+    return;
+  }
+  if (tokenIs(kind, "null")) {
+    // Read from the reserved region below the vector table.
+    volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(0xFFFFFFF0u);
+    volatile uint32_t v = *p;
+    (void)v;
+    Serial.println(F("-> NO FAULT from the bad read"));
+    return;
+  }
+  if (tokenIs(kind, "stack")) {
+    Serial.println(F("recursing until the stack is gone..."));
+    Serial.flush();
+    blowStack(1);
+    return;
+  }
+  if (tokenIs(kind, "hang")) {
+    // No fault at all: just stop feeding the watchdog. This is the OTHER
+    // recovery path, and it is the slow one (~5.6 s).
+    Serial.println(F("hanging the main loop; the watchdog should reset us"));
+    Serial.flush();
+    for (;;) {
+    }
+  }
+  if (tokenIs(kind, "trap")) {
+    __builtin_trap();
+    return;
+  }
+
+  Serial.println(F("-> unknown fault kind"));
 }
 
 void SerialConsole::runCommand(CommandType type, const char* label,
@@ -306,6 +375,10 @@ void SerialConsole::handleLine(uint32_t now, PumpController& pump,
   }
   if (tokenIs(verb, "test") || tokenIs(verb, "t")) {
     startLampTest(now, pump);
+    return;
+  }
+  if (tokenIs(verb, "fault")) {
+    injectFault(arg, pump, now);
     return;
   }
   if (tokenIs(verb, "scan")) {

@@ -82,6 +82,8 @@ class SerialConsole {
   void printStatus(const PumpController& pump, const NetManager& net) const;
   void runCommand(CommandType type, const char* label,
                   PumpController& pump, uint32_t now);
+  void injectFault(const char* kind, PumpController& pump, uint32_t now);
+
   void startLampTest(uint32_t now, PumpController& pump);
   void advanceLampTest(uint32_t now, PumpController& pump);
   void fireLamp(CommandType type, const char* what,

@@ -22,6 +22,7 @@
 
 #include "api_handler.h"
 #include "config.h"
+#include "fault_handler.h"
 #include "http_server.h"
 #include "led_matrix.h"
 #include "net_manager.h"
@@ -100,6 +101,12 @@ void printHeartbeat(uint32_t now) {
 }  // namespace
 
 void setup() {
+  // Before anything else: find out why we are here, and make integer
+  // divide-by-zero a detectable fault rather than silently wrong arithmetic.
+  const ResetReason resetReason = consumeResetReason();
+  noteBoot();
+  enableDivideByZeroTrap();
+
   // ---------------------------------------------------------------------
   // 1. Relays first, before anything else can take time.
   //
@@ -123,6 +130,12 @@ void setup() {
   Serial.print(F("Relay polarity: active-"));
   Serial.println(RELAY_ACTIVE_LOW ? F("LOW") : F("HIGH"));
   Serial.println(F("Initial state: UNKNOWN (engine status unproven after reset)"));
+  Serial.print(F("Reset reason: "));
+  Serial.println(toString(resetReason));
+  Serial.print(F("Boots since power-on: "));
+  Serial.print(bootCount());
+  Serial.print(F("  faults: "));
+  Serial.println(faultCountSincePowerOn());
 
   g_matrix.begin();
   g_console.begin();
