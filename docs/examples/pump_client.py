@@ -106,11 +106,22 @@ class RelayOutputs:
 
     These are what the firmware is driving. They do NOT prove that a relay
     physically moved, that a contact closed, or that the engine did anything.
+
+    `kill` is True when the kill is ASSERTED: the ignition-kill wire is
+    grounded and the engine is inhibited. K3 is wired to its NC contact, so
+    "asserted" means the relay is DE-energised -- which is also its resting
+    state and what happens on any power loss. A GX390's magneto ignition does
+    not stop when the controller loses power, so this inversion is what makes
+    power loss safe. Expect kill=True whenever the pump is not running.
+
+    `valve` is True when the normally-closed INTAKE valve is energised, i.e.
+    OPEN. Meaningless on builds with the electric valve deleted; check
+    PumpStatus.intake_valve_enabled first.
     """
     starter: bool = False
     choke: bool = False
-    kill: bool = False
-    spare: bool = False
+    kill: bool = True
+    valve: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,17 +150,24 @@ class Timings:
     Use these to render an accurate progress indicator rather than assuming
     the config.h defaults.
     """
+    valve_prime_ms: int = 5000
     choke_prep_ms: int = 1000
     crank_ms: int = 2000
     unchoke_delay_ms: int = 500
     kill_hold_ms: int = 3000
+    valve_close_delay_ms: int = 3000
     min_recrank_gap_ms: int = 10000
     max_crank_ms: int = 5000
 
-    @property
-    def total_start_ms(self) -> int:
-        """How long a full start sequence will take, end to end."""
-        return self.choke_prep_ms + self.crank_ms + self.unchoke_delay_ms
+    def total_start_ms(self, with_valve: bool = True) -> int:
+        """How long a full start sequence takes, end to end."""
+        prime = self.valve_prime_ms if with_valve else 0
+        return prime + self.choke_prep_ms + self.crank_ms + self.unchoke_delay_ms
+
+    def total_stop_ms(self, with_valve: bool = True) -> int:
+        """How long a stop takes to settle back to IDLE."""
+        close = self.valve_close_delay_ms if with_valve else 0
+        return self.kill_hold_ms + close
 
 
 @dataclass(frozen=True)
@@ -166,6 +184,8 @@ class PumpStatus:
     cooldown_remaining_ms: int
     last_command: Optional[LastCommand]
     fault: Optional[str]
+    water_ok: bool = False
+    intake_valve_enabled: bool = False
     timings: Timings = field(default_factory=Timings)
     maintenance_api: bool = False
     raw: dict = field(repr=False, default_factory=dict)
@@ -179,12 +199,15 @@ class PumpStatus:
         Advisory only, for greying out a button. The device is the authority
         and will answer 409 regardless of what this says.
         """
-        return self.state == "IDLE" and self.cooldown_remaining_ms == 0
+        return (self.state == "IDLE"
+                and self.cooldown_remaining_ms == 0
+                and self.water_ok)
 
     @property
     def sequence_active(self) -> bool:
         """True while relay timing is in progress -- poll faster during this."""
-        return self.state in ("CHOKING", "CRANKING", "UNCHOKING", "STOPPING")
+        return self.state in ("PRIMING", "CHOKING", "CRANKING", "UNCHOKING",
+                              "STOPPING", "VALVE_CLOSING")
 
     @property
     def needs_operator_reset(self) -> bool:
@@ -205,15 +228,19 @@ class PumpStatus:
         """
         if self.faulted:
             return f"FAULT: {self.fault}"
+        if self.state == "IDLE" and not self.water_ok:
+            return "No water available - cannot start"
         return {
             "UNKNOWN": "Status unknown - confirm the engine is stopped",
             "IDLE": ("Ready to start" if self.cooldown_remaining_ms == 0
                      else f"Cooling down ({self.cooldown_remaining_ms // 1000}s)"),
+            "PRIMING": "Priming... (intake open)",
             "CHOKING": "Starting... (choke)",
             "CRANKING": "Starting... (cranking)",
             "UNCHOKING": "Starting... (releasing choke)",
             "RUNNING_ASSUMED": "Start sequence completed - check the camera",
             "STOPPING": "Stopping...",
+            "VALVE_CLOSING": "Stopped - closing intake",
             "RETRY_WAIT": (f"Waiting before another attempt "
                            f"({self.cooldown_remaining_ms // 1000}s)"),
         }.get(self.state, self.state)
@@ -234,8 +261,8 @@ class PumpStatus:
             relay_outputs=RelayOutputs(
                 starter=bool(relays.get("starter", False)),
                 choke=bool(relays.get("choke", False)),
-                kill=bool(relays.get("kill", False)),
-                spare=bool(relays.get("spare", False)),
+                kill=bool(relays.get("kill", True)),
+                valve=bool(relays.get("valve", False)),
             ),
             wifi=WifiInfo(
                 connected=bool(wifi.get("connected", False)),
@@ -249,6 +276,8 @@ class PumpStatus:
                 accepted=bool(last.get("accepted", False)),
             ) if isinstance(last, dict) else None),
             fault=body.get("fault"),
+            water_ok=bool(body.get("water_ok", False)),
+            intake_valve_enabled=bool(body.get("intake_valve_enabled", False)),
             timings=Timings(**{k: int(v) for k, v in
                                (body.get("timings") or {}).items()
                                if k in Timings.__dataclass_fields__}),
@@ -491,24 +520,34 @@ class PumpClient:
                     request_id: Optional[str] = None) -> CommandResult:
         """POST /v1/maintenance/{relay}/{on|off} -- drive one relay directly.
 
-        `relay` is "choke", "starter" or "kill".
+        `relay` is "choke", "starter", "kill" or "valve".
+
+        Note the polarity of each: maintenance("kill", True) ASSERTS the kill
+        (de-energising K3, grounding the ignition), and maintenance("valve",
+        True) OPENS the normally-closed intake.
 
         For bench commissioning only. This bypasses the start/stop sequencing
         that makes the normal API safe, which is why the device ships with
         the endpoints disabled -- check PumpStatus.maintenance_api before
         offering it in a UI.
 
-        The hard interlocks still apply on the device: the starter cannot be
-        energised while the kill circuit is grounded (409), grounding kill
-        releases the starter first, the starter is still force-released at
-        max_crank_ms, and the choke at its own backstop. Manual commands are
-        only accepted from IDLE or UNKNOWN.
+        The hard interlocks still apply on the device, and they are strict:
+        the starter cannot be engaged while the kill is asserted OR before the
+        pump is confirmed primed (intake open for the full prime dwell, water
+        available), the intake cannot be shut while the engine may be running,
+        asserting kill releases the starter first, the starter is still
+        force-released at max_crank_ms, and STOP still overrides everything.
+        Manual commands are only accepted from IDLE or UNKNOWN.
+
+        To exercise the starter you must therefore open the valve, wait out
+        valve_prime_ms, and release the kill first -- exactly as a real start
+        does. That is deliberate.
 
         Never wire this into an operator-facing control. It is a screwdriver,
         not a feature.
         """
-        if relay not in ("choke", "starter", "kill"):
-            raise ValueError(f"relay must be choke, starter or kill, "
+        if relay not in ("choke", "starter", "kill", "valve"):
+            raise ValueError(f"relay must be choke, starter, kill or valve, "
                              f"got {relay!r}")
         action = "on" if on else "off"
         return self._command(f"/v1/maintenance/{relay}/{action}",

@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: Fire Pump Controller API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     LAN control API for an Arduino UNO R4 WiFi that operates the electric
     start, choke and ignition-kill circuits of a Honda GX390 water pump.
@@ -77,13 +77,18 @@ paths:
       description: |
         Permitted **only** from `IDLE`, and only once the recrank cooldown has
         expired. Returns `202` as soon as the sequence is accepted; it then
-        runs asynchronously on the device for roughly 3.5 s:
+        runs asynchronously on the device for roughly 8.5 s:
 
-        1. Ensure kill open and starter inactive
-        2. Activate choke → `CHOKING`
-        3. After `CHOKE_PREP_MS` (1000 ms) activate starter → `CRANKING`
+        1. Open the INTAKE valve → `PRIMING` (kill stays asserted)
+        2. After `VALVE_PRIME_MS` (5000 ms) activate choke → `CHOKING`
+        3. After `CHOKE_PREP_MS` (1000 ms) release the kill AND activate the
+           starter → `CRANKING`
         4. After `CRANK_DURATION_MS` (2000 ms) release starter → `UNCHOKING`
         5. After `UNCHOKE_DELAY_MS` (500 ms) release choke → `RUNNING_ASSUMED`
+
+        Additionally requires `water_ok`. The starter is interlocked on the
+        pump being CONFIRMED primed -- intake open for the full dwell AND
+        water available -- so no path can crank a dry pump.
 
         There is **no automatic retry** if the engine fails to start.
         Accepts optional per-request timing overrides; see the
@@ -117,9 +122,14 @@ paths:
         `FAULT`. It is never rejected merely because another operation is
         active, and never returns `409`.
 
-        Effect, in this order: deactivate starter, deactivate choke, activate
-        kill, enter `STOPPING`, hold kill for `KILL_HOLD_MS` (3000 ms),
-        release kill, enter `IDLE`.
+        Effect, in this order: release starter, release choke, ASSERT kill,
+        enter `STOPPING`, hold for `KILL_HOLD_MS` (3000 ms), enter
+        `VALVE_CLOSING`, wait `VALVE_CLOSE_DELAY_MS` (3000 ms) for the engine
+        to come to rest, shut the intake, enter `IDLE`.
+
+        The kill is NOT released at the end -- asserted is its resting,
+        fail-safe position. The intake is deliberately left open until the
+        engine has stopped: shutting it on a spinning pump runs it dry.
 
         **Exempt from duplicate suppression.** A replayed request ID is still
         labelled `duplicate: true` but the stop is always executed — skipping
@@ -231,7 +241,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [choke, starter, kill]
+            enum: [choke, starter, kill, valve]
         - name: action
           in: path
           required: true
@@ -417,18 +427,22 @@ components:
 
     PumpState:
       type: string
-      enum: [UNKNOWN, IDLE, CHOKING, CRANKING, UNCHOKING, RUNNING_ASSUMED,
-             STOPPING, RETRY_WAIT, FAULT]
+      enum: [UNKNOWN, IDLE, PRIMING, CHOKING, CRANKING, UNCHOKING,
+             RUNNING_ASSUMED, STOPPING, VALVE_CLOSING, RETRY_WAIT, FAULT]
       description: |
         * `UNKNOWN` — after every power-on or watchdog reset. Engine state
           unproven; `START` refused until an operator sends `/v1/reset-idle`.
-        * `IDLE` — ready; all relays open.
+        * `IDLE` — ready; engine inhibited (kill asserted), intake shut.
+        * `PRIMING` — intake valve open, priming before the crank sequence.
+          The kill stays asserted throughout.
         * `CHOKING` — choke engaged, waiting `CHOKE_PREP_MS` before cranking.
         * `CRANKING` — starter engaged.
         * `UNCHOKING` — starter released, waiting to release the choke.
         * `RUNNING_ASSUMED` — sequence completed without error. **Assumed, not
           measured.**
-        * `STOPPING` — kill circuit grounded for `KILL_HOLD_MS`.
+        * `STOPPING` — kill asserted; engine winding down. The intake stays
+          OPEN here.
+        * `VALVE_CLOSING` — engine given time to stop, then the intake shuts.
         * `RETRY_WAIT` — enforcing the minimum interval between starter
           attempts; falls back to `IDLE`. Never auto-retries.
         * `FAULT` — a safety invariant tripped. Sticky until cleared by
@@ -442,13 +456,17 @@ components:
     FaultCode:
       type: [string, "null"]
       enum: [null, STARTER_KILL_CONFLICT, STARTER_OVERRUN, CHOKE_OVERRUN,
-             SPARE_ACTIVE, ILLEGAL_TRANSITION]
+             VALVE_CLOSED_WHILE_RUNNING, WATER_LOST, ILLEGAL_TRANSITION]
       description: |
         * `STARTER_KILL_CONFLICT` — starter and kill commanded together.
         * `STARTER_OVERRUN` — starter active past `MAX_CRANK_MS` (5000 ms),
           which implies the main loop stalled during a crank. Investigate.
         * `CHOKE_OVERRUN` — choke active past `MAX_CHOKE_MS` (30000 ms).
-        * `SPARE_ACTIVE` — K4 found active; it must never be.
+        * `VALVE_CLOSED_WHILE_RUNNING` — the intake was found shut with the
+          engine turning, or a crank was attempted on an unprimed pump. The
+          pump may have run dry.
+        * `WATER_LOST` — the water interlock dropped while the engine was
+          running; the controller stopped the engine.
         * `ILLEGAL_TRANSITION` — the state machine reached an impossible state.
 
     RelayOutputs:
@@ -456,13 +474,35 @@ components:
       description: |
         The Arduino's **commanded** output states. These do not prove that the
         physical relay moved, that a contact closed, or that the engine did
-        anything. `spare` (K4) is always `false`.
-      required: [starter, choke, kill, spare]
+        anything.
+      required: [starter, choke, kill, valve]
       properties:
-        starter: { type: boolean, description: K1 — starter solenoid trigger }
-        choke:   { type: boolean, description: K2 — choke actuator trigger }
-        kill:    { type: boolean, description: K3 — ignition kill to ground }
-        spare:   { type: boolean, description: K4 — always false }
+        starter:
+          type: boolean
+          description: K1 — starter solenoid trigger.
+        choke:
+          type: boolean
+          description: K2 — choke actuator trigger.
+        kill:
+          type: boolean
+          description: |
+            K3 — **true means the kill is ASSERTED**: the ignition wire is
+            grounded and the engine is inhibited.
+
+            A GX390's magneto ignition does not stop when the controller loses
+            power, so K3 is wired to its NORMALLY-CLOSED contact and must be
+            held ENERGISED for the engine to be permitted to run. "Asserted"
+            therefore means the relay is DE-energised — its resting position,
+            and what happens on power loss, a watchdog reset or a broken wire.
+
+            **`true` is the normal value.** It is `false` only in `CRANKING`,
+            `UNCHOKING` and `RUNNING_ASSUMED`. Do not render it as an alarm.
+        valve:
+          type: boolean
+          description: |
+            K4 — true means the normally-closed **intake** valve is energised,
+            i.e. OPEN. Always `false` on builds with
+            `intake_valve_enabled: false`.
 
     WifiInfo:
       type: object
@@ -488,9 +528,22 @@ components:
         Timings the current (or most recent) start sequence is using,
         **including any per-request override**. Drive progress indicators from
         this rather than from hardcoded constants.
-      required: [choke_prep_ms, crank_ms, unchoke_delay_ms, kill_hold_ms,
-                 min_recrank_gap_ms, max_crank_ms]
+      required: [valve_prime_ms, choke_prep_ms, crank_ms, unchoke_delay_ms,
+                 kill_hold_ms, valve_close_delay_ms, min_recrank_gap_ms,
+                 max_crank_ms]
       properties:
+        valve_prime_ms:
+          type: integer
+          description: |
+            How long the intake valve is held open to prime before the crank
+            sequence begins. The starter is interlocked on this dwell having
+            fully elapsed, so it is not merely cosmetic.
+        valve_close_delay_ms:
+          type: integer
+          description: |
+            After the kill hold, how long the controller waits before shutting
+            the intake — time for the engine to come to rest, so the pump is
+            never starved of water while still spinning.
         choke_prep_ms:
           type: integer
           description: Choke engaged before the starter is engaged.
@@ -518,7 +571,8 @@ components:
       required:
         [device, firmware_version, state, state_elapsed_ms, uptime_ms,
          engine_status, running_confirmed, relay_outputs, wifi,
-         cooldown_remaining_ms, timings, maintenance_api, last_command, fault]
+         cooldown_remaining_ms, water_ok, intake_valve_enabled, timings,
+         maintenance_api, last_command, fault]
       properties:
         device:
           type: string
@@ -549,6 +603,25 @@ components:
             confirmed "running" in a UI.
         relay_outputs:
           $ref: '#/components/schemas/RelayOutputs'
+        water_ok:
+          type: boolean
+          description: |
+            Debounced state of the water-available interlock on the intake.
+            `false` blocks `START` with `409`, and losing it while running
+            raises a `WATER_LOST` fault and stops the engine.
+
+            The sensor input uses a pull-up, so a broken wire or absent sensor
+            reads as `false` — wiring failures fail safe. Note the PRIMARY
+            protection is hardwired: the same switch grounds the ignition-kill
+            wire directly, independently of this firmware.
+        intake_valve_enabled:
+          type: boolean
+          description: |
+            Whether this build has the electrically operated intake valve
+            (`ENABLE_INTAKE_VALVE`). When `false` there is no `PRIMING` or
+            `VALVE_CLOSING` phase, `relay_outputs.valve` is meaningless, and
+            the intake is assumed to be a permanently open manual valve with a
+            foot/check valve retaining prime.
         wifi:
           $ref: '#/components/schemas/WifiInfo'
         cooldown_remaining_ms:

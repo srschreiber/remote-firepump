@@ -25,7 +25,12 @@ from pump_client import (PumpAuthError, PumpClient, PumpClientBug,
                          PumpConflict, PumpUnreachable, StatusPoller,
                          new_request_id)
 from stub_server import (CHOKE_PREP_MS, CRANK_DURATION_MS, KILL_HOLD_MS,
-                         UNCHOKE_DELAY_MS, serve)
+                         UNCHOKE_DELAY_MS, VALVE_CLOSE_DELAY_MS,
+                         VALVE_PRIME_MS, serve)
+
+FULL_START_S = (VALVE_PRIME_MS + CHOKE_PREP_MS + CRANK_DURATION_MS +
+                UNCHOKE_DELAY_MS) / 1000
+FULL_STOP_S = (KILL_HOLD_MS + VALVE_CLOSE_DELAY_MS) / 1000
 
 SECRET = "test-secret-abcdefghijklmnop"
 
@@ -57,7 +62,7 @@ def settle_to_idle(pump: PumpClient) -> None:
     st = pump.status()
     if st.state != "IDLE":
         pump.stop()
-        time.sleep(KILL_HOLD_MS / 1000 + 0.2)
+        time.sleep(FULL_STOP_S + 0.3)
     remaining = pump.status().cooldown_remaining_ms
     if remaining:
         time.sleep(remaining / 1000 + 0.2)
@@ -81,10 +86,17 @@ def main() -> int:
         st = pump.status()
         check("initial state is UNKNOWN", st.state == "UNKNOWN", st.state)
         check("running_confirmed is false", st.running_confirmed is False)
-        check("no relay is active", not any(vars(st.relay_outputs).values()))
+        # The kill is ASSERTED at rest -- that is the fail-safe position, not
+        # an idle relay. Only the three that can do work must be off.
+        check("starter, choke and intake are all at rest",
+              not st.relay_outputs.starter and not st.relay_outputs.choke
+              and not st.relay_outputs.valve, str(st.relay_outputs))
+        check("the engine is inhibited at boot (kill asserted)",
+              st.relay_outputs.kill is True)
+        check("water interlock reports available", st.water_ok is True)
         check("needs_operator_reset is true", st.needs_operator_reset)
         check("start_permitted is false", not st.start_permitted)
-        check("firmware version reported", st.firmware_version == "0.1.0",
+        check("firmware version reported", st.firmware_version == "0.2.0",
               st.firmware_version)
 
         # -- START refused from UNKNOWN ------------------------------------
@@ -107,11 +119,15 @@ def main() -> int:
         print("\n[start sequence]")
         r = pump.start()
         check("START accepted from IDLE", r.accepted)
-        check("START enters CHOKING", r.state == "CHOKING", r.state)
+        check("START enters PRIMING (intake first, not the choke)",
+              r.state == "PRIMING", r.state)
+        check("START opened the intake", pump.status().relay_outputs.valve)
+        check("START did NOT release the kill yet",
+              pump.status().relay_outputs.kill is True)
         check("START is not a duplicate", not r.duplicate)
 
         seen = set()
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + FULL_START_S + 4
         while time.monotonic() < deadline:
             s = pump.status()
             seen.add(s.state)
@@ -119,7 +135,8 @@ def main() -> int:
                 break
             time.sleep(0.05)
 
-        for expected in ("CHOKING", "CRANKING", "UNCHOKING", "RUNNING_ASSUMED"):
+        for expected in ("PRIMING", "CHOKING", "CRANKING", "UNCHOKING",
+                         "RUNNING_ASSUMED"):
             check(f"observed {expected}", expected in seen, str(sorted(seen)))
 
         st = pump.status()
@@ -131,6 +148,8 @@ def main() -> int:
               "camera" in st.display_text.lower(), st.display_text)
         check("cooldown is now outstanding", st.cooldown_remaining_ms > 0,
               f"{st.cooldown_remaining_ms} ms")
+        check("the intake stays open while running", st.relay_outputs.valve)
+        check("the engine is permitted to run", st.relay_outputs.kill is False)
 
         # -- START refused mid-sequence and during cooldown ----------------
         print("\n[START refused outside IDLE]")
@@ -146,13 +165,22 @@ def main() -> int:
         r = pump.stop()
         check("STOP accepted from RUNNING_ASSUMED", r.accepted)
         check("STOP enters STOPPING", r.state == "STOPPING", r.state)
-        check("kill relay grounded", pump.status().relay_outputs.kill)
+        check("kill grounded", pump.status().relay_outputs.kill)
         check("starter released", not pump.status().relay_outputs.starter)
+        check("STOP leaves the intake OPEN (never shut on a running pump)",
+              pump.status().relay_outputs.valve)
 
         time.sleep(KILL_HOLD_MS / 1000 + 0.3)
         st = pump.status()
-        check("returns to IDLE after the kill hold", st.state == "IDLE", st.state)
-        check("kill released", not st.relay_outputs.kill)
+        check("enters VALVE_CLOSING after the kill hold",
+              st.state == "VALVE_CLOSING", st.state)
+        check("intake still open in VALVE_CLOSING", st.relay_outputs.valve)
+
+        time.sleep(VALVE_CLOSE_DELAY_MS / 1000 + 0.4)
+        st = pump.status()
+        check("returns to IDLE after the intake closes", st.state == "IDLE", st.state)
+        check("intake shut", not st.relay_outputs.valve)
+        check("the kill stays asserted at rest", st.relay_outputs.kill is True)
 
         # -- START refused during the recrank cooldown ---------------------
         st = pump.status()
@@ -182,7 +210,7 @@ def main() -> int:
 
         # Wait out the sequence, then confirm only one crank happened by
         # checking we are in RUNNING_ASSUMED and not cranking again.
-        time.sleep((CHOKE_PREP_MS + CRANK_DURATION_MS + UNCHOKE_DELAY_MS) / 1000 + 0.5)
+        time.sleep(FULL_START_S + 0.6)
         check("sequence completed once", pump.status().state == "RUNNING_ASSUMED",
               pump.status().state)
 
@@ -191,7 +219,7 @@ def main() -> int:
         srid = new_request_id("stop")
         s1 = pump.stop(request_id=srid)
         check("first STOP not flagged duplicate", not s1.duplicate)
-        time.sleep(KILL_HOLD_MS / 1000 + 0.3)
+        time.sleep(FULL_STOP_S + 0.4)
         check("returned to IDLE", pump.status().state == "IDLE")
 
         s2 = pump.stop(request_id=srid)
@@ -199,21 +227,26 @@ def main() -> int:
         check("replayed STOP is STILL executed", s2.state == "STOPPING", s2.state)
         check("replayed STOP re-grounds the kill circuit",
               pump.status().relay_outputs.kill)
-        time.sleep(KILL_HOLD_MS / 1000 + 0.3)
+        time.sleep(FULL_STOP_S + 0.4)
 
         # -- start-failed ---------------------------------------------------
         print("\n[start-failed]")
         settle_to_idle(pump)
         pump.start()
-        time.sleep((CHOKE_PREP_MS + CRANK_DURATION_MS + UNCHOKE_DELAY_MS) / 1000 + 0.5)
+        time.sleep(FULL_START_S + 0.6)
         check("reached RUNNING_ASSUMED", pump.status().state == "RUNNING_ASSUMED")
 
         r = pump.start_failed()
         check("start-failed accepted", r.accepted)
         check("start-failed enters RETRY_WAIT", r.state == "RETRY_WAIT", r.state)
         st = pump.status()
-        check("no relay active in RETRY_WAIT",
-              not any(vars(st.relay_outputs).values()))
+        check("starter, choke and intake all off in RETRY_WAIT",
+              not st.relay_outputs.starter and not st.relay_outputs.choke
+              and not st.relay_outputs.valve, str(st.relay_outputs))
+        check("start-failed shuts the intake (engine never caught)",
+              not st.relay_outputs.valve)
+        check("start-failed leaves the engine inhibited",
+              st.relay_outputs.kill is True)
         check("RETRY_WAIT reports a cooldown", st.cooldown_remaining_ms > 0)
 
         # It must never auto-retry.
@@ -313,8 +346,15 @@ def main() -> int:
               str(st.timings))
         check("status reports the hard crank ceiling",
               st.timings.max_crank_ms == 5000)
-        check("total_start_ms is computed", st.timings.total_start_ms == 3500,
-              str(st.timings.total_start_ms))
+        check("total_start_ms includes the prime dwell",
+              st.timings.total_start_ms() == 8500,
+              str(st.timings.total_start_ms()))
+        check("total_stop_ms includes the intake close delay",
+              st.timings.total_stop_ms() == 6000,
+              str(st.timings.total_stop_ms()))
+        check("valve timings reported",
+              st.timings.valve_prime_ms == 5000
+              and st.timings.valve_close_delay_ms == 3000, str(st.timings))
 
         settle_to_idle(pump)
         pump.start(crank_ms=1000, choke_ms=300, unchoke_ms=200)
@@ -326,11 +366,13 @@ def main() -> int:
               st.timings.max_crank_ms == 5000)
 
         t0 = time.monotonic()
-        while pump.status().state != "RUNNING_ASSUMED" and time.monotonic() - t0 < 5:
+        while (pump.status().state != "RUNNING_ASSUMED"
+               and time.monotonic() - t0 < FULL_START_S + 4):
             time.sleep(0.02)
         elapsed_ms = (time.monotonic() - t0) * 1000
-        check("the shortened sequence really was shorter", elapsed_ms < 2500,
-              f"{elapsed_ms:.0f} ms for a 1500 ms sequence")
+        # 300 + 1000 + 200 plus the fixed 5000 ms prime dwell.
+        check("the shortened sequence really was shorter", elapsed_ms < 8000,
+              f"{elapsed_ms:.0f} ms")
 
         settle_to_idle(pump)
         try:
@@ -401,26 +443,43 @@ def main() -> int:
         maint.maintenance("choke", False)
         check("choke relay released", not maint.status().relay_outputs.choke)
 
-        # Interlock: starter cannot join a grounded kill.
-        maint.maintenance("kill", True)
-        check("kill relay is grounded", maint.status().relay_outputs.kill)
+        # The kill is already asserted at rest; confirm it.
+        check("kill asserted at rest", maint.status().relay_outputs.kill)
         try:
             maint.maintenance("starter", True)
-            check("starter refused while kill is grounded", False)
+            check("starter refused while kill is asserted", False)
         except PumpConflict:
-            check("starter refused while kill is grounded", True)
+            check("starter refused while kill is asserted", True)
         check("starter stayed open", not maint.status().relay_outputs.starter)
-        maint.maintenance("kill", False)
 
-        # Grounding kill releases a manually held starter.
-        maint.maintenance("starter", True)
-        check("manual starter engaged", maint.status().relay_outputs.starter)
+        # Releasing the kill is still not enough: the pump must be primed.
+        maint.maintenance("kill", False)
+        try:
+            maint.maintenance("starter", True)
+            check("starter refused before the pump is primed", False)
+        except PumpConflict:
+            check("starter refused before the pump is primed", True)
+
+        # Open the intake, but crank before the dwell elapses.
+        maint.maintenance("valve", True)
+        try:
+            maint.maintenance("starter", True)
+            check("starter refused on a freshly opened intake", False)
+        except PumpConflict:
+            check("starter refused on a freshly opened intake", True)
+
+        # Now wait out the full prime dwell.
+        time.sleep(VALVE_PRIME_MS / 1000 + 0.3)
+        r = maint.maintenance("starter", True)
+        check("starter permitted once properly primed", r.accepted)
+        check("starter engaged", maint.status().relay_outputs.starter)
+
+        # Asserting the kill releases the starter first.
         maint.maintenance("kill", True)
         s = maint.status()
-        check("kill-on released the starter first",
+        check("asserting kill released the starter first",
               s.relay_outputs.kill and not s.relay_outputs.starter,
               str(s.relay_outputs))
-        maint.maintenance("kill", False)
 
         # STOP still overrides everything.
         maint.maintenance("choke", True)
@@ -430,6 +489,7 @@ def main() -> int:
               not s.relay_outputs.choke and not s.relay_outputs.starter,
               str(s.relay_outputs))
         check("STOP grounded the kill circuit", s.relay_outputs.kill)
+        time.sleep(FULL_STOP_S + 0.4)
     finally:
         shutdown2()
 

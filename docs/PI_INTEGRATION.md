@@ -161,26 +161,51 @@ with the 12 V side disconnected. If you surface it at all, put it behind a
 ```json
 {
   "device": "fire-pump-controller",
-  "firmware_version": "0.1.0",
+  "firmware_version": "0.2.0",
   "state": "IDLE",
   "state_elapsed_ms": 12345,
   "uptime_ms": 456789,
   "engine_status": "STOPPED_ASSUMED",
   "running_confirmed": false,
   "relay_outputs": {
-    "starter": false, "choke": false, "kill": false, "spare": false
+    "starter": false, "choke": false, "kill": true, "valve": false
   },
+  "water_ok": true,
+  "intake_valve_enabled": true,
   "wifi": { "connected": true, "ip": "192.168.1.50", "rssi_dbm": -57 },
   "cooldown_remaining_ms": 0,
   "timings": {
-    "choke_prep_ms": 1000, "crank_ms": 2000, "unchoke_delay_ms": 500,
-    "kill_hold_ms": 3000, "min_recrank_gap_ms": 10000, "max_crank_ms": 5000
+    "valve_prime_ms": 5000, "choke_prep_ms": 1000, "crank_ms": 2000,
+    "unchoke_delay_ms": 500, "kill_hold_ms": 3000,
+    "valve_close_delay_ms": 3000, "min_recrank_gap_ms": 10000,
+    "max_crank_ms": 5000
   },
   "maintenance_api": false,
   "last_command": { "type": "STOP", "request_id": "stop-123", "accepted": true },
   "fault": null
 }
 ```
+
+> ### ⚠️ `"kill": true` is the NORMAL resting value
+>
+> This trips people up, so read it once carefully.
+>
+> A Honda GX390 has a **magneto ignition**: it does not stop when the
+> controller loses power. K3 is therefore wired to its **normally-closed**
+> contact and must be held **energised** for the engine to be *permitted* to
+> run. Letting go stops the engine.
+>
+> `relay_outputs.kill` reports whether the kill is **ASSERTED** — the ignition
+> wire grounded, the engine inhibited:
+>
+> | `kill` | Meaning | When |
+> |---|---|---|
+> | `true` | Engine inhibited (K3 de-energised) | `UNKNOWN`, `IDLE`, `PRIMING`, `CHOKING`, `STOPPING`, `VALVE_CLOSING`, `RETRY_WAIT` — i.e. **most of the time** |
+> | `false` | Engine permitted to run (K3 energised) | `CRANKING`, `UNCHOKING`, `RUNNING_ASSUMED` only |
+>
+> **Do not render `kill: true` as an alarm or an active output.** It is the
+> safe state. If you want a "engine permitted to run" indicator, that is
+> `kill == false`.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -189,7 +214,9 @@ with the 12 V side disconnected. If you surface it at all, put it behind a
 | `uptime_ms` | uint32 | **Wraps at ~49.7 days.** Do not compute durations by subtracting across a poll gap without handling wrap. |
 | `engine_status` | string | `UNKNOWN` / `STOPPED_ASSUMED` / `STARTING` / `RUNNING_ASSUMED` / `STOPPING` |
 | `running_confirmed` | bool | **Always `false`.** See §6. |
-| `relay_outputs` | object | **Commanded** output states, not proof of anything |
+| `relay_outputs` | object | **Commanded** output states, not proof of anything. `kill` is inverted — see the box above. `valve` is `true` when the normally-closed **intake** valve is OPEN. |
+| `water_ok` | bool | Debounced water-available interlock. `false` blocks `START` with `409`. A broken sensor wire reads as `false`. |
+| `intake_valve_enabled` | bool | Whether this build has the electric intake valve. `false` means `valve` is meaningless and there is no `PRIMING` phase. |
 | `cooldown_remaining_ms` | uint32 | Recrank cooldown; `START` is refused while > 0 |
 | `timings` | object | Timings the current/most recent start sequence is using, **including any override**. Drive your progress UI from this, not from hardcoded constants. `max_crank_ms` is the hard ceiling and never moves. |
 | `maintenance_api` | bool | Whether the device was built with the maintenance endpoints. Normally `false`. |
@@ -247,26 +274,39 @@ also returns `401`. That is intentional.
 You do not need to reimplement this, but your UI must reflect it correctly.
 
 ```
-UNKNOWN ──reset-idle──▶ IDLE ──start──▶ CHOKING ──▶ CRANKING ──▶ UNCHOKING ──▶ RUNNING_ASSUMED
-                         ▲                                                        │
-                         │                                            start-failed│
-                         │                                                        ▼
-                         ├──────────────── MIN_RECRANK_GAP ──────────────── RETRY_WAIT
-                         │
-                         └────── KILL_HOLD ────── STOPPING ◀──stop── (ANY state)
+UNKNOWN ─reset-idle─▶ IDLE ─start─▶ PRIMING ─▶ CHOKING ─▶ CRANKING ─▶ UNCHOKING ─▶ RUNNING_ASSUMED
+                       ▲            (intake              (kill                          │
+                       │             opens)              released)          start-failed│
+                       │                                                                ▼
+                       ├─────────────────── MIN_RECRANK_GAP ─────────────────── RETRY_WAIT
+                       │
+                       └─ VALVE_CLOSING ◀─ KILL_HOLD ─ STOPPING ◀─stop─ (ANY state)
+                          (intake shuts)
 
-                                          FAULT ◀── invariant violated
+                                        FAULT ◀── invariant violated
 ```
+
+Two ordering rules the whole design turns on, both enforced on the device:
+
+1. **The engine is never cranked before the pump is confirmed primed** —
+   intake open for the full `valve_prime_ms` dwell *and* `water_ok`.
+2. **The intake is never shut while the engine may be running** — `STOP`
+   grounds the kill, holds, then waits `valve_close_delay_ms` before closing.
+
+You do not need to implement either. Just don't build a UI that implies you
+can skip them.
 
 | State | Meaning | What the Pi should show | START allowed? |
 |---|---|---|---|
 | `UNKNOWN` | Just booted; engine status unproven | "Status unknown — confirm the engine is stopped" + a **Confirm stopped** button | No |
-| `IDLE` | Ready, all relays open | "Ready to start" (or the cooldown, if any) | Yes, if `cooldown_remaining_ms == 0` |
+| `IDLE` | Ready; engine inhibited, intake shut | "Ready to start" (or the cooldown / no-water reason) | Yes, if `cooldown_remaining_ms == 0` **and** `water_ok` |
+| `PRIMING` | Intake open, priming before the crank | "Priming… (intake open)" | No |
 | `CHOKING` | Choke engaged, pre-crank | "Starting… (choke)" | No |
 | `CRANKING` | Starter engaged | "Starting… (cranking)" | No |
 | `UNCHOKING` | Starter released, choke releasing | "Starting… (releasing choke)" | No |
 | `RUNNING_ASSUMED` | Sequence completed without error | "Start sequence completed — **check the camera**" | No |
-| `STOPPING` | Kill circuit grounded | "Stopping…" | No |
+| `STOPPING` | Kill grounded; engine winding down, intake still open | "Stopping…" | No |
+| `VALVE_CLOSING` | Engine stopped; shutting the intake | "Stopped — closing intake" | No |
 | `RETRY_WAIT` | Cooling down after a failed start | "Waiting before another attempt: Ns" | No |
 | `FAULT` | Safety invariant tripped | "FAULT: `<fault>`" prominently + recovery action | No |
 
@@ -274,17 +314,26 @@ Default timings — but **read them from `/v1/status`'s `timings` object rather
 than hardcoding**, since they are configurable at build time and overridable
 per request:
 
-| Field | Default |
-|---|---|
-| `choke_prep_ms` | 1000 |
-| `crank_ms` | 2000 |
-| `unchoke_delay_ms` | 500 |
-| `kill_hold_ms` | 3000 |
-| `min_recrank_gap_ms` | 10000 |
-| `max_crank_ms` | 5000 (hard ceiling, never moves) |
+| Field | Default | Phase |
+|---|---|---|
+| `valve_prime_ms` | 5000 | `PRIMING` |
+| `choke_prep_ms` | 1000 | `CHOKING` |
+| `crank_ms` | 2000 | `CRANKING` |
+| `unchoke_delay_ms` | 500 | `UNCHOKING` |
+| `kill_hold_ms` | 3000 | `STOPPING` |
+| `valve_close_delay_ms` | 3000 | `VALVE_CLOSING` |
+| `min_recrank_gap_ms` | 10000 | `RETRY_WAIT` |
+| `max_crank_ms` | 5000 | hard ceiling, never moves |
 
-So a default start takes about **3.5 s** from `202` to `RUNNING_ASSUMED`, and a
-stop takes about **3 s** to return to `IDLE`.
+So a default start now takes about **8.5 s** from `202` to `RUNNING_ASSUMED`
+(the 5 s prime dominates), and a stop takes about **6 s** to return to `IDLE`.
+
+Both are noticeably longer than before the intake valve existed. Size your
+progress UI and any request timeouts from `timings`, not from memory. The
+client exposes `timings.total_start_ms()` and `timings.total_stop_ms()`.
+
+On a build with `intake_valve_enabled: false` there is no `PRIMING` or
+`VALVE_CLOSING` phase; pass `with_valve=False` to those helpers.
 
 ---
 
@@ -345,10 +394,11 @@ When `fault` is non-null the device is in `FAULT` and will refuse `START`.
 
 | `fault` | Cause | Severity |
 |---|---|---|
+| `WATER_LOST` | The water interlock dropped while the engine was running. The controller stopped the engine. | **Urgent.** The pump may have run dry. Notify immediately and do not clear without inspecting. |
+| `VALVE_CLOSED_WHILE_RUNNING` | The intake was found shut with the engine turning, or a crank was attempted unprimed | **Urgent.** Same as above. |
 | `STARTER_OVERRUN` | Starter was active past `MAX_CRANK_MS` — the main loop stalled during a crank | **Investigate.** Alert the operator. |
-| `STARTER_KILL_CONFLICT` | Starter and kill commanded together | **Investigate.** Should be impossible. |
+| `STARTER_KILL_CONFLICT` | Starter commanded with the kill asserted | **Investigate.** Should be impossible. |
 | `CHOKE_OVERRUN` | Choke active past `MAX_CHOKE_MS` | Investigate |
-| `SPARE_ACTIVE` | K4 found active | Investigate |
 
 Recovery: `POST /v1/stop` (lands in `IDLE`) or `POST /v1/reset-idle`. Both
 clear the fault.
@@ -421,8 +471,10 @@ Model your UI on this, not on a generic on/off switch.
    state == UNKNOWN ──▶ "Confirm the engine is stopped"
                           └─▶ POST /v1/reset-idle ──▶ IDLE
 
-   state == IDLE, cooldown 0 ──▶ [ START ] (with a confirmation dialog)
-                          └─▶ POST /v1/start ──▶ CHOKING…RUNNING_ASSUMED
+   state == IDLE, cooldown 0, water_ok ──▶ [ START ] (confirmation dialog)
+                          └─▶ POST /v1/start ──▶ PRIMING…RUNNING_ASSUMED (~8.5 s)
+
+   water_ok == false ──▶ "No water available" — START disabled, reason shown
 
    state == RUNNING_ASSUMED ──▶ "Check the camera"
                           ├─▶ it started  → done
@@ -439,7 +491,13 @@ Model your UI on this, not on a generic on/off switch.
 * **STOP:** always visible, always enabled, no confirmation, visually distinct
   (large, red). It is the emergency control.
 * **START:** confirmation dialog — this starts a real engine remotely. Disable
-  it whenever `state != "IDLE"` or `cooldown_remaining_ms > 0`, and show why.
+  it whenever `state != "IDLE"`, `cooldown_remaining_ms > 0`, or
+  `water_ok == false`, and show **which** of those is blocking it.
+* **Water:** surface `water_ok` prominently. It is the single condition that
+  protects the pump's mechanical seal, and an operator who cannot see it will
+  not understand why START is refused.
+* **`kill: true` is normal.** Do not style it as an alarm. If you show a
+  relay panel at all, label it "engine inhibited", not "kill active".
 * **Cooldown:** show it counting down, do not just grey out the button.
 * **Camera feed:** put it next to the controls. The operator must be able to
   confirm without switching apps.
@@ -527,6 +585,10 @@ understanding of a state transition, that suite is the executable spec.
 - [ ] `START` behind a confirmation dialog
 - [ ] No automatic retry anywhere in the codebase
 - [ ] `RUNNING_ASSUMED` never worded as confirmed running
+- [ ] `water_ok` shown to the operator, and START disabled with a reason when false
+- [ ] `kill: true` not styled as an alarm — it is the safe resting state
+- [ ] Progress UI driven from `timings`, not hardcoded (a start is ~8.5 s now)
+- [ ] `WATER_LOST` / `VALVE_CLOSED_WHILE_RUNNING` raise an urgent notification
 - [ ] Camera feed adjacent to the controls
 - [ ] Audit log of every command with operator identity
 - [ ] Faults raise a notification and require deliberate human clearing
