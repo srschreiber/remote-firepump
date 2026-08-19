@@ -154,7 +154,9 @@ constexpr uint32_t MAX_CHOKE_MS = 30000;
 // permanently and fit a foot/check valve to retain prime. Then set this to 0,
 // K4 goes unused, and a whole class of failure disappears.
 //
-// If you do enable it, the hardwired water interlock below is MANDATORY.
+// If you do enable it, read ACKNOWLEDGE_NO_WATER_INTERLOCK below. A water
+// interlock is strongly preferred; running without one is permitted only as
+// an explicit, acknowledged trade-off.
 #ifndef ENABLE_INTAKE_VALVE
 #define ENABLE_INTAKE_VALVE 1
 #endif
@@ -202,21 +204,69 @@ constexpr uint32_t WATER_DEBOUNCE_MS = 750;
 // on, so a pump that has not yet built pressure is not immediately killed.
 constexpr uint32_t WATER_STARTUP_GRACE_MS = 15000;
 
-// When 0, the firmware treats water as always available. This exists ONLY so
-// the logic can be bench-tested before a sensor is fitted; it is refused at
-// compile time whenever the intake valve is enabled, because that combination
-// is the specific hazard this interlock exists to cover.
+// When 0, the firmware has no water sensor and treats water as always
+// available. Prime then becomes purely time-based: the valve is opened and the
+// dwell observed, and the firmware trusts that an open valve means water.
 #ifndef REQUIRE_WATER_INTERLOCK
-#define REQUIRE_WATER_INTERLOCK 1
+#define REQUIRE_WATER_INTERLOCK 0
 #endif
 
 constexpr bool WATER_INTERLOCK_REQUIRED = (REQUIRE_WATER_INTERLOCK != 0);
 
-static_assert(!INTAKE_VALVE_ENABLED || WATER_INTERLOCK_REQUIRED,
+// ---------------------------------------------------------------------------
+// Running an intake valve with no water sensor
+// ---------------------------------------------------------------------------
+//
+// This combination is a DELIBERATE, ACKNOWLEDGED trade-off on this install.
+// It must stay deliberate, so it has to be acknowledged explicitly rather
+// than arrived at by editing one flag.
+//
+// What is given up: the firmware can no longer tell the difference between
+// "valve commanded open, water flowing" and "valve commanded open, but the
+// actuator is stuck, the fuse is blown, the lead is broken, or the source is
+// dry". In every one of those the pump runs without water and the mechanical
+// seal is damaged.
+//
+// What still works, because it does not depend on sensing water:
+//   * the starter is refused unless the valve is commanded open and the prime
+//     dwell has elapsed;
+//   * the engine is shut down if the valve is ever commanded shut while it
+//     could be turning;
+//   * K3's NC contact still grounds the ignition on power loss or reset.
+//
+// The operator is the sensor: the camera confirms the engine caught and that
+// water is moving. That is a one-off human check, not a continuous one, so
+// this configuration relies on the pump not being left running unattended.
+#ifndef ACKNOWLEDGE_NO_WATER_INTERLOCK
+#define ACKNOWLEDGE_NO_WATER_INTERLOCK 1
+#endif
+
+static_assert(!INTAKE_VALVE_ENABLED || WATER_INTERLOCK_REQUIRED ||
+                  ACKNOWLEDGE_NO_WATER_INTERLOCK,
               "An electrically operated intake valve without a water "
-              "interlock can run the pump dry and destroy the seal. Either "
-              "fit the interlock (REQUIRE_WATER_INTERLOCK=1) or delete the "
-              "electric valve (ENABLE_INTAKE_VALVE=0).");
+              "interlock can run the pump dry and destroy the seal. Fit the "
+              "interlock (REQUIRE_WATER_INTERLOCK=1), delete the electric "
+              "valve (ENABLE_INTAKE_VALVE=0), or acknowledge the risk "
+              "explicitly (ACKNOWLEDGE_NO_WATER_INTERLOCK=1).");
+
+
+// ---------------------------------------------------------------------------
+// DANGER_OVERRIDE
+// ---------------------------------------------------------------------------
+//
+// A command carrying the X-Danger-Override header is forced past the
+// PRECONDITION interlocks: not being IDLE, an unexpired recrank cooldown, an
+// incomplete prime dwell, relays not at rest, absent water.
+//
+// It does NOT relax the destructive-limit backstops -- MAX_CRANK_MS, the
+// starter/kill exclusion, shutdown on a commanded-shut intake, or the
+// fail-safe kill on reset. Those are not judgement calls.
+//
+// The value must match this phrase EXACTLY. A bare "true" or "1" is rejected
+// with 400 on purpose: a generic HTTP client, a proxy adding defaults, or a
+// copied curl line should not be able to arm this by accident. Typing the
+// phrase is the point.
+constexpr char DANGER_OVERRIDE_TOKEN[] = "I-ACCEPT-THE-RISK";
 
 // ---------------------------------------------------------------------------
 // Per-request timing overrides

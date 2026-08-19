@@ -156,7 +156,7 @@ bool PumpController::engineWasStarted() const {
 bool PumpController::primeComplete() const {
   // Water must be present regardless of how the intake is controlled -- that
   // is the actual precondition for cranking, not the position of a valve.
-  if (!waterOk_) {
+  if (!waterOk_ && !overrideActive_) {
     return false;
   }
   if (!INTAKE_VALVE_ENABLED) {
@@ -164,6 +164,12 @@ bool PumpController::primeComplete() const {
     // a foot/check valve holds prime, so the water interlock is the whole
     // condition.
     return true;
+  }
+  if (overrideActive_) {
+    // DANGER_OVERRIDE skips the dwell, but NOT the valve position: cranking
+    // with the intake commanded shut is the dry-run case the whole design
+    // exists to prevent, and no override relaxes it.
+    return valveActive_;
   }
   return valveActive_ &&
          static_cast<uint32_t>(now_ - valveOpenedAt_) >= VALVE_PRIME_MS;
@@ -348,6 +354,10 @@ void PumpController::begin(uint32_t now) {
   // Normally-closed valve: de-energised at reset means physically shut.
   valveActive_   = false;
 
+  // An override never survives a reboot.
+  overrideActive_ = false;
+  overrideCount_  = 0;
+
   waterOk_ = false;
   waterRawLast_ = false;
   waterStableSince_ = now;
@@ -386,6 +396,26 @@ void PumpController::enterState(PumpState next) {
   logEvent(LogEvent::STATE_CHANGE, static_cast<uint8_t>(state_), false);
   state_ = next;
   stateEnteredAt_ = now_;
+
+  // An override authorises one start sequence and dies with it. Every state
+  // outside that sequence clears it, so it can never be inherited by a later
+  // start that did not ask for it. Listing the states that KEEP it -- rather
+  // than the ones that clear it -- means a new state added later defaults to
+  // clearing, which is the safe direction.
+  switch (next) {
+    case PumpState::PRIMING:
+    case PumpState::CHOKING:
+    case PumpState::CRANKING:
+    case PumpState::UNCHOKING:
+    case PumpState::RUNNING_ASSUMED:
+      break;
+    default:
+      if (overrideActive_) {
+        Serial.println(F("[CMD] DANGER_OVERRIDE cleared"));
+      }
+      overrideActive_ = false;
+      break;
+  }
 }
 
 void PumpController::enterFault(FaultCode code) {
@@ -561,7 +591,11 @@ void PumpController::advance(uint32_t now) {
       break;
 
     case PumpState::PRIMING:
-      if (elapsed >= VALVE_PRIME_MS) {
+      // The dwell is a precondition, so DANGER_OVERRIDE skips it. The valve
+      // is still driven OPEN first, and the starter is still gated on
+      // primeComplete() at the relay layer, which under an override means
+      // "intake commanded open" rather than "intake open long enough".
+      if (overrideActive_ || elapsed >= VALVE_PRIME_MS) {
         // Valve has been open long enough to prime; begin the start sequence.
         setChokeRelay(true);
         enterState(PumpState::CHOKING);
@@ -721,11 +755,23 @@ bool PumpController::isQuiescent() const {
   }
 }
 
-bool PumpController::startPermitted(uint32_t now) const {
+bool PumpController::startPermitted(uint32_t now, bool dangerOverride) const {
+  // DANGER_OVERRIDE forces the start past every precondition below. None of
+  // these are destructive limits: they are the firmware's judgement that a
+  // start is unlikely to be what the operator wants right now. On a fire pump
+  // the operator may legitimately disagree.
+  //
+  // The sequence that follows is unchanged, and every relay-layer backstop --
+  // MAX_CRANK_MS, the starter/kill exclusion, the shut-intake shutdown --
+  // still applies with full force.
+  if (dangerOverride) {
+    return true;
+  }
   if (state_ != PumpState::IDLE || cooldownRemainingMs(now) != 0) {
     return false;
   }
   // Water must be available before the engine is allowed to run at all.
+  // Without a sensor fitted this is forced true; see updateWaterInterlock().
   if (!waterOk_) {
     return false;
   }
@@ -743,10 +789,14 @@ bool PumpController::startPermitted(uint32_t now) const {
   return true;
 }
 
-bool PumpController::maintenancePermitted() const {
+bool PumpController::maintenancePermitted(bool dangerOverride) const {
   // Only from a settled state. Never mid-sequence, never from FAULT.
+  if (dangerOverride) {
+    return true;
+  }
   return state_ == PumpState::IDLE || state_ == PumpState::UNKNOWN;
 }
+
 
 bool PumpController::applyMaintenance(CommandType type) {
   switch (type) {
@@ -855,7 +905,8 @@ void PumpController::rememberLastCommand(CommandType type, const char* requestId
 CommandResult PumpController::handleCommand(CommandType type,
                                             const char* requestId,
                                             uint32_t now,
-                                            const StartTimings* timings) {
+                                            const StartTimings* timings,
+                                            bool dangerOverride) {
   now_ = now;
 
   // Safety limits are re-evaluated before any command is acted on, so a
@@ -891,7 +942,11 @@ CommandResult PumpController::handleCommand(CommandType type,
   Serial.print(F("[CMD] "));
   Serial.print(toString(type));
   Serial.print(F(" in state "));
-  Serial.println(toString(state_));
+  Serial.print(toString(state_));
+  if (dangerOverride) {
+    Serial.print(F("  *** DANGER_OVERRIDE ***"));
+  }
+  Serial.println();
 
   switch (type) {
     case CommandType::STOP: {
@@ -904,11 +959,15 @@ CommandResult PumpController::handleCommand(CommandType type,
     }
 
     case CommandType::START: {
-      if (!startPermitted(now)) {
+      if (!startPermitted(now, dangerOverride)) {
         out.accepted = false;
         out.httpStatus = 409;
         break;
       }
+      // Latch for the whole sequence, not just this call: the prime dwell is
+      // checked later, in tick(), by which time the flag on the request is
+      // long gone. Cleared when the sequence ends -- see clearOverride().
+      overrideActive_ = dangerOverride;
       // Latch the timings this run will use. clamp() is applied here as well
       // as at the HTTP layer, so no caller can request a longer crank than
       // the hard ceiling even if validation is ever bypassed.
@@ -1006,7 +1065,7 @@ CommandResult PumpController::handleCommand(CommandType type,
     case CommandType::MAINT_KILL_OFF:
     case CommandType::MAINT_VALVE_ON:
     case CommandType::MAINT_VALVE_OFF: {
-      if (!maintenancePermitted()) {
+      if (!maintenancePermitted(dangerOverride)) {
         out.accepted = false;
         out.httpStatus = 409;
         break;
@@ -1042,6 +1101,14 @@ CommandResult PumpController::handleCommand(CommandType type,
     recordCommand(type, requestId, out.accepted, out.httpStatus);
   }
   rememberLastCommand(type, requestId, out.accepted);
+
+  // Counted once per accepted overridden command and never reset except by a
+  // reboot, so an override cannot be used and quietly forgotten.
+  if (dangerOverride && out.accepted && !out.duplicate) {
+    ++overrideCount_;
+    Serial.print(F("[CMD] DANGER_OVERRIDE used; total since boot: "));
+    Serial.println(overrideCount_);
+  }
 
   logEvent(LogEvent::COMMAND, static_cast<uint8_t>(type), out.accepted);
 

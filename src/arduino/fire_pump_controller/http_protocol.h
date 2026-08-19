@@ -70,6 +70,13 @@ struct ParsedRequest {
   uint32_t crankMs   = 0;
   uint32_t unchokeMs = 0;
 
+  // X-Danger-Override. `dangerOverride` is set only by an EXACT match on
+  // DANGER_OVERRIDE_TOKEN; any other value sets `dangerOverrideMalformed`,
+  // which is a 400. Silently ignoring a misspelt override would leave the
+  // caller believing an interlock was bypassed when it was not.
+  bool dangerOverride          = false;
+  bool dangerOverrideMalformed = false;
+
   // GET /v1/log?since=<seq>. The one endpoint that takes a query parameter.
   bool     sincePresent = false;
   bool     sinceMalformed = false;
@@ -184,6 +191,16 @@ struct StatusView {
   bool valve = false;   // K4: true means the NC intake valve is OPEN
   bool valveEnabled = INTAKE_VALVE_ENABLED;
   bool waterOk = false; // debounced water-available interlock
+
+  // Whether a water sensor exists at all. Without this the client cannot tell
+  // "no water" from "no sensor": both leave waterOk false on older builds.
+  bool waterSensorFitted = WATER_INTERLOCK_REQUIRED;
+
+  // True while a start sequence authorised by DANGER_OVERRIDE is running.
+  // overrideCount is cumulative since boot and never resets, so an override
+  // used once cannot disappear from the record.
+  bool     overrideActive = false;
+  uint32_t overrideCount  = 0;
 
   bool        wifiConnected = false;
   const char* ip = "0.0.0.0";

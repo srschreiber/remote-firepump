@@ -26,6 +26,7 @@ sources=(
   "$here/test_extensions.cpp"
   "$here/test_valve_water.cpp"
   "$here/test_event_log.cpp"
+  "$here/test_danger_override.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"
@@ -50,23 +51,32 @@ failed=0
 #   * both relay polarities, so RELAY_ACTIVE_LOW is proven to be the single
 #     point of control rather than assumed to be;
 #   * maintenance API both enabled and disabled, so the flag's effect on
-#     endpoint reachability is proven in each direction.
+#     endpoint reachability is proven in each direction;
+#   * water interlock present and absent. This install runs WITHOUT a water
+#     sensor, but the interlock tests guard `if (!WATER_INTERLOCK_REQUIRED)
+#     return;` -- so building only the sensorless configuration would leave
+#     22 tests reporting "ok" while asserting nothing. Both are built so the
+#     sensor logic stays covered for anyone who fits one.
 for polarity in true false; do
   for maint in 1 0; do
+    for water in 0 1; do
     if [ "$polarity" = "true" ]; then p_name="active-low"; else p_name="active-high"; fi
     if [ "$maint" = "1" ]; then m_name="maint-on"; else m_name="maint-off"; fi
-    name="$p_name-$m_name"
+    if [ "$water" = "1" ]; then w_name="water-sensor"; else w_name="no-water-sensor"; fi
+    name="$p_name-$m_name-$w_name"
     exe="$build/tests_$name"
 
     echo
     echo "=== building host tests ($name) ==="
     "$CXX" "${common[@]}" "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" \
-           "-DENABLE_MAINTENANCE_API=$maint" "${sources[@]}" -o "$exe"
+           "-DENABLE_MAINTENANCE_API=$maint" \
+           "-DREQUIRE_WATER_INTERLOCK=$water" "${sources[@]}" -o "$exe"
 
     echo "=== running host tests ($name) ==="
     if ! "$exe" "$@"; then
       failed=1
     fi
+    done
   done
 done
 

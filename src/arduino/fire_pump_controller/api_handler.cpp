@@ -45,6 +45,8 @@ void makeStatusView(StatusView& v,
   v.valve   = pump.valveActive();
   v.valveEnabled = INTAKE_VALVE_ENABLED;
   v.waterOk = pump.waterOk();
+  v.overrideActive = pump.overrideActive();
+  v.overrideCount = pump.overrideCount();
 
   v.wifiConnected = net.connected;
   v.ip = net.ip;
@@ -184,6 +186,15 @@ void planResponse(ResponsePlan& out,
   StartTimings timings;                 // config.h defaults
   const StartTimings* timingArg = nullptr;
 
+  // A misspelt override is a 400, never a silent normal command. The caller
+  // must never be able to believe an interlock was bypassed when it was not.
+  if (req.dangerOverrideMalformed) {
+    emitError(out, 400, "invalid_danger_override",
+              "X-Danger-Override must be the exact acknowledgement phrase",
+              toString(pump.state()), 0, false);
+    return;
+  }
+
   if (req.anyTimingOverride()) {
     if (route.command != CommandType::START) {
       emitError(out, 400, "timing_override_not_applicable",
@@ -230,8 +241,8 @@ void planResponse(ResponsePlan& out,
     timingArg = &timings;
   }
 
-  const CommandResult result =
-      pump.handleCommand(route.command, requestId, nowMs, timingArg);
+  const CommandResult result = pump.handleCommand(
+      route.command, requestId, nowMs, timingArg, req.dangerOverride);
 
   if (!result.accepted) {
     // 409: valid, authenticated, but not permitted from the current state.

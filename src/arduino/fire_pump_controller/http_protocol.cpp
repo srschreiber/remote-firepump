@@ -273,6 +273,17 @@ void RequestParser::handleHeaderLine() {
     return;
   }
 
+  if (headerNameIs(line_, nameLen, "x-danger-override")) {
+    const size_t tokenLen = sizeof(DANGER_OVERRIDE_TOKEN) - 1;
+    if (valueLen == tokenLen &&
+        memcmp(value, DANGER_OVERRIDE_TOKEN, tokenLen) == 0) {
+      req_.dangerOverride = true;
+    } else {
+      req_.dangerOverrideMalformed = true;
+    }
+    return;
+  }
+
   if (headerNameIs(line_, nameLen, "x-request-id")) {
     req_.requestIdPresent = true;
     if (valueLen == 0 || valueLen > REQUEST_ID_MAX_LEN) {
@@ -512,7 +523,9 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       "\"engine_status\":\"%s\","
       "\"running_confirmed\":%s,"
       "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"valve\":%s},"
-      "\"water_ok\":%s,\"intake_valve_enabled\":%s,"
+      "\"water_ok\":%s,\"water_sensor_fitted\":%s,"
+      "\"intake_valve_enabled\":%s,"
+      "\"danger_override_active\":%s,\"danger_override_count\":%lu,"
       "\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi_dbm\":%ld},"
       "\"cooldown_remaining_ms\":%lu,"
       "\"timings\":{\"valve_prime_ms\":%lu,\"choke_prep_ms\":%lu,"
@@ -528,7 +541,10 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       static_cast<unsigned long>(v.uptimeMs),
       v.engineStatus, jsonBool(v.runningConfirmed),
       jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.valve),
-      jsonBool(v.waterOk), jsonBool(v.valveEnabled),
+      jsonBool(v.waterOk), jsonBool(v.waterSensorFitted),
+      jsonBool(v.valveEnabled),
+      jsonBool(v.overrideActive),
+      static_cast<unsigned long>(v.overrideCount),
       jsonBool(v.wifiConnected), v.ip, static_cast<long>(v.rssiDbm),
       static_cast<unsigned long>(v.cooldownRemainingMs),
       static_cast<unsigned long>(VALVE_PRIME_MS),

@@ -128,9 +128,24 @@ class PumpController {
   // `timings` applies only to CommandType::START and is ignored otherwise.
   // Pass nullptr to use the config.h defaults. Values are clamped to the
   // configured ceilings before they take effect.
+  // `dangerOverride` forces the command past the PRECONDITION interlocks: not
+  // being in IDLE, an unexpired recrank cooldown, an incomplete prime dwell,
+  // relays not at rest, and (where a sensor is fitted) absent water.
+  //
+  // It deliberately does NOT relax the destructive-limit backstops, which are
+  // not judgement calls the operator is entitled to overrule:
+  //   * MAX_CRANK_MS starter engagement ceiling
+  //   * starter and kill never commanded active together
+  //   * the engine being shut down if the intake is commanded shut
+  //   * the fail-safe kill asserted on reset or fault
+  //
+  // Every overridden command is logged and surfaced in status. The override
+  // is never latched across commands: it applies to the one call that carries
+  // it, and to the start sequence that call authorises.
   CommandResult handleCommand(CommandType type, const char* requestId,
                               uint32_t now,
-                              const StartTimings* timings = nullptr);
+                              const StartTimings* timings = nullptr,
+                              bool dangerOverride = false);
 
   // --- observers -----------------------------------------------------------
 
@@ -181,6 +196,15 @@ class PumpController {
   // operation may be performed without disturbing a safety-critical sequence.
   bool isQuiescent() const;
 
+  // True while a start sequence authorised by DANGER_OVERRIDE is still
+  // running. Surfaced in status so the UI can show the pump is running under
+  // an override rather than a normal, fully-interlocked start.
+  bool overrideActive() const { return overrideActive_; }
+
+  // Total overridden commands accepted since boot. Never reset except by a
+  // reboot, so an override cannot be used and quietly forgotten.
+  uint32_t overrideCount() const { return overrideCount_; }
+
   CommandType lastCommandType() const { return lastCommandType_; }
   const char* lastCommandRequestId() const { return lastCommandRequestId_; }
   bool lastCommandAccepted() const { return lastCommandAccepted_; }
@@ -224,8 +248,8 @@ class PumpController {
   void beginStopSequence();
   void noteStarterReleased();
 
-  bool startPermitted(uint32_t now) const;
-  bool maintenancePermitted() const;
+  bool startPermitted(uint32_t now, bool dangerOverride) const;
+  bool maintenancePermitted(bool dangerOverride) const;
   bool applyMaintenance(CommandType type);
 
   uint8_t relayFlags(bool extra) const;
@@ -255,6 +279,12 @@ class PumpController {
   FaultCode fault_        = FaultCode::NONE;
   uint32_t  stateEnteredAt_ = 0;
   uint32_t  now_          = 0;  // last value passed to tick()/handleCommand()
+
+  // Set when an overridden START is accepted; cleared whenever the sequence
+  // it authorised ends (idle, stop, or fault). Needed because the prime-dwell
+  // check happens later, in tick(), not at command time.
+  bool     overrideActive_ = false;
+  uint32_t overrideCount_  = 0;
 
   bool     starterActive_ = false;
   bool     chokeActive_   = false;
