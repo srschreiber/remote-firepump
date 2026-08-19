@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+#include "event_log.h"
+
 // ---------------------------------------------------------------------------
 // Name tables
 // ---------------------------------------------------------------------------
@@ -89,6 +91,22 @@ const char* toString(FaultCode f) {
 // Relay layer — the only place digitalWrite() is called
 // ---------------------------------------------------------------------------
 
+uint8_t PumpController::relayFlags(bool extra) const {
+  uint8_t f = extra ? LOG_FLAG_BIT : 0u;
+  if (starterActive_) f |= LOG_RELAY_STARTER;
+  if (chokeActive_)   f |= LOG_RELAY_CHOKE;
+  if (killActive_)    f |= LOG_RELAY_KILL;
+  if (valveActive_)   f |= LOG_RELAY_VALVE;
+  return f;
+}
+
+void PumpController::logEvent(LogEvent ev, uint8_t detail, bool flag) const {
+  // A handful of stores into a fixed ring. Cannot block, cannot allocate, so
+  // it is safe to call from the relay layer and the safety enforcer.
+  eventLog().add(now_, ev, static_cast<uint8_t>(state_), detail,
+                 relayFlags(flag));
+}
+
 void PumpController::setRelayOutput(uint8_t pin, bool active) {
   // Polarity is applied exactly once, here.
   const uint8_t level = RELAY_ACTIVE_LOW ? (active ? LOW : HIGH)
@@ -158,6 +176,7 @@ void PumpController::setValveRelay(bool active) {
       valveOpenedAt_ = now_;
       setRelayOutput(PIN_RELAY_VALVE, true);
       Serial.println(F("[RELAY] valve OPEN"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::VALVE), true);
     }
     return;
   }
@@ -209,6 +228,7 @@ void PumpController::setStarterRelay(bool active) {
       starterOnAt_ = now_;
       setRelayOutput(PIN_RELAY_STARTER, true);
       Serial.println(F("[RELAY] starter ON"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::STARTER), true);
     }
   } else {
     if (starterActive_) {
@@ -216,6 +236,7 @@ void PumpController::setStarterRelay(bool active) {
       setRelayOutput(PIN_RELAY_STARTER, false);
       noteStarterReleased();
       Serial.println(F("[RELAY] starter OFF"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::STARTER), false);
     } else {
       // Idempotent: keep the physical line asserted inactive regardless.
       setRelayOutput(PIN_RELAY_STARTER, false);
@@ -230,12 +251,14 @@ void PumpController::setChokeRelay(bool active) {
       chokeOnAt_ = now_;
       setRelayOutput(PIN_RELAY_CHOKE, true);
       Serial.println(F("[RELAY] choke ON"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::CHOKE), true);
     }
   } else {
     if (chokeActive_) {
       chokeActive_ = false;
       setRelayOutput(PIN_RELAY_CHOKE, false);
       Serial.println(F("[RELAY] choke OFF"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::CHOKE), false);
     } else {
       setRelayOutput(PIN_RELAY_CHOKE, false);
     }
@@ -266,12 +289,14 @@ void PumpController::setKillRelay(bool active) {
       killActive_ = true;
       driveKillOutput(true);
       Serial.println(F("[RELAY] kill ON"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::KILL), true);
     }
   } else {
     if (killActive_) {
       killActive_ = false;
       driveKillOutput(false);
       Serial.println(F("[RELAY] kill OFF"));
+      logEvent(LogEvent::RELAY, static_cast<uint8_t>(LogRelay::KILL), false);
     } else {
       driveKillOutput(false);
     }
@@ -340,6 +365,9 @@ void PumpController::begin(uint32_t now) {
   state_ = PumpState::UNKNOWN;
   stateEnteredAt_ = now;
 
+  eventLog().clear();
+  logEvent(LogEvent::BOOT, 0, false);
+
   memset(records_, 0, sizeof(records_));
   recordNext_ = 0;
   lastCommandType_ = CommandType::NONE;
@@ -355,6 +383,7 @@ void PumpController::enterState(PumpState next) {
   Serial.print(toString(state_));
   Serial.print(F(" -> "));
   Serial.println(toString(next));
+  logEvent(LogEvent::STATE_CHANGE, static_cast<uint8_t>(state_), false);
   state_ = next;
   stateEnteredAt_ = now_;
 }
@@ -370,6 +399,7 @@ void PumpController::enterFault(FaultCode code) {
   Serial.print(F("[FAULT] "));
   const char* name = toString(code);
   Serial.println(name != nullptr ? name : "NONE");
+  logEvent(LogEvent::FAULT, static_cast<uint8_t>(code), false);
 
   // Always shed the two relays that can do harm. The valve is deliberately
   // NOT touched here: if the engine might be running, shutting it would
@@ -417,6 +447,7 @@ void PumpController::updateWaterInterlock(uint32_t now) {
     if (waterOk_ != raw) {
       Serial.print(F("[WATER] "));
       Serial.println(raw ? F("available") : F("LOST"));
+      logEvent(LogEvent::WATER, raw ? 1u : 0u, raw);
     }
     waterOk_ = raw;
   }
@@ -1011,6 +1042,8 @@ CommandResult PumpController::handleCommand(CommandType type,
     recordCommand(type, requestId, out.accepted, out.httpStatus);
   }
   rememberLastCommand(type, requestId, out.accepted);
+
+  logEvent(LogEvent::COMMAND, static_cast<uint8_t>(type), out.accepted);
 
   Serial.print(F("[CMD] result accepted="));
   Serial.print(out.accepted ? 1 : 0);

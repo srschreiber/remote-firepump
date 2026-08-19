@@ -151,7 +151,8 @@ std::string doRequest(PumpController& pump, const std::string& raw,
   parser.scrubSecret();
 
   outStatus = plan.status;
-  return std::string(plan.body, plan.bodyLen);
+  // Log batches live in their own buffer; payload() picks the right one.
+  return std::string(plan.payload(), plan.bodyLen);
 }
 
 void checkRelayPins(const PumpController& p, const char* where) {

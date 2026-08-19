@@ -25,6 +25,14 @@ struct ResponsePlan {
   uint16_t status = 500;
   size_t   bodyLen = 0;
   char     body[HTTP_BODY_MAX] = {0};
+
+  // /v1/log batches are larger than any other response, so they get their own
+  // buffer rather than inflating HTTP_BODY_MAX for every reply. `useLogBody`
+  // says which one holds the payload.
+  bool     useLogBody = false;
+  char     logBody[LOG_BODY_MAX] = {0};
+
+  const char* payload() const { return useLogBody ? logBody : body; }
 };
 
 // Produces the complete response for a fully parsed (or failed) request.

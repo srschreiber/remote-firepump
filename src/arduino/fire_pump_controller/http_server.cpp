@@ -33,7 +33,7 @@ void HttpServer::respond(const ResponsePlan& plan) {
   }
   client_.write(reinterpret_cast<const uint8_t*>(head_), headLen);
   if (plan.bodyLen > 0) {
-    client_.write(reinterpret_cast<const uint8_t*>(plan.body), plan.bodyLen);
+    client_.write(reinterpret_cast<const uint8_t*>(plan.payload()), plan.bodyLen);
   }
   client_.flush();
 

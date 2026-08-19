@@ -35,9 +35,11 @@ $sources = @(
     (Join-Path $here 'test_invariants.cpp'),
     (Join-Path $here 'test_extensions.cpp'),
     (Join-Path $here 'test_valve_water.cpp'),
+    (Join-Path $here 'test_event_log.cpp'),
     (Join-Path $fw   'pump_controller.cpp'),
     (Join-Path $fw   'http_protocol.cpp'),
-    (Join-Path $fw   'api_handler.cpp')
+    (Join-Path $fw   'api_handler.cpp'),
+    (Join-Path $fw   'event_log.cpp')
 )
 
 $common = @(

@@ -131,6 +131,39 @@ void planResponse(ResponsePlan& out,
     return;
   }
 
+  // ---- 4b. GET /v1/log?since=<seq> ----------------------------------------
+  if (route.action == RouteAction::LOG) {
+    if (req.sinceMalformed) {
+      emitError(out, 400, "invalid_since",
+                "since must be a plain decimal sequence number",
+                toString(pump.state()), 0, false);
+      return;
+    }
+    const EventLog& logRef = eventLog();
+
+    // Bounded: at most LOG_MAX_PER_RESPONSE entries leave in one reply, so a
+    // drain can never monopolise the loop or overflow the buffer. The client
+    // pages using the returned `next`.
+    static LogEntry batch[LOG_MAX_PER_RESPONSE];
+    uint32_t nextSeq = 0;
+    const uint32_t since = req.sincePresent ? req.since : 0;
+    const size_t n = logRef.drain(since, batch, LOG_MAX_PER_RESPONSE, nextSeq);
+    const bool truncated = (nextSeq != logRef.nextSeq());
+
+    out.status = 200;
+    out.bodyLen = buildLogJson(out.logBody, sizeof(out.logBody), batch, n,
+                               nextSeq, logRef.oldestSeq(), logRef.dropped(),
+                               truncated);
+    out.useLogBody = true;
+    if (out.bodyLen == 0) {
+      out.useLogBody = false;
+      emitError(out, 500, "log_serialization_failed",
+                "log batch exceeded the response buffer",
+                toString(pump.state()), 0, false);
+    }
+    return;
+  }
+
   // ---- 5. State-changing commands -----------------------------------------
   if (req.requestIdPresent && !req.requestIdValid) {
     emitError(out, 400, "invalid_request_id",

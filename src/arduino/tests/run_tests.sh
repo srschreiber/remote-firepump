@@ -25,9 +25,11 @@ sources=(
   "$here/test_invariants.cpp"
   "$here/test_extensions.cpp"
   "$here/test_valve_water.cpp"
+  "$here/test_event_log.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"
+  "$fw/event_log.cpp"
 )
 
 # NOTE: -Wuseless-cast is deliberately NOT enabled. The rollover-safe idiom

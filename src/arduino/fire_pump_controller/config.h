@@ -368,6 +368,31 @@ constexpr size_t   HTTP_BYTES_PER_PASS = 128;
 constexpr uint8_t  IDEMPOTENCY_SLOTS = 8;
 
 // ---------------------------------------------------------------------------
+// Event log
+// ---------------------------------------------------------------------------
+//
+// A single ring, read non-destructively with a cursor. That gives both
+// properties at once: entries survive until overwritten (so nothing is lost
+// while the Pi is away), and the Pi "flushes" simply by advancing `since`.
+//
+// A separate flush-on-read buffer would cost twice the RAM and be less safe:
+// destructive reads lose data if the Pi dies between receiving a batch and
+// writing it to disk. With a cursor the read is idempotent -- re-requesting
+// the same `since` returns the same entries.
+//
+// 128 x 12 bytes = 1.5 KB. A full start/stop cycle emits roughly a dozen
+// entries, so at any sane poll interval the ring never wraps between drains.
+constexpr size_t   LOG_RING_ENTRIES = 128;
+
+// Entries per response. Bounded so one drain cannot monopolise the loop or
+// overflow the response buffer; the Pi pages with the returned `next`.
+constexpr size_t   LOG_MAX_PER_RESPONSE = 20;
+
+// Response buffer for /v1/log. Entries are emitted as compact tuples rather
+// than objects -- about 34 bytes each instead of ~110.
+constexpr size_t   LOG_BODY_MAX = 1536;
+
+// ---------------------------------------------------------------------------
 // LED matrix status display (cosmetic)
 // ---------------------------------------------------------------------------
 //

@@ -14,6 +14,7 @@
 #include <Arduino.h>
 
 #include "config.h"
+#include "event_log.h"
 
 enum class PumpState : uint8_t {
   UNKNOWN = 0,
@@ -226,6 +227,9 @@ class PumpController {
   bool startPermitted(uint32_t now) const;
   bool maintenancePermitted() const;
   bool applyMaintenance(CommandType type);
+
+  uint8_t relayFlags(bool extra) const;
+  void logEvent(LogEvent ev, uint8_t detail, bool flag) const;
 
   void updateWaterInterlock(uint32_t now);
   bool waterStartupGraceActive(uint32_t now) const;

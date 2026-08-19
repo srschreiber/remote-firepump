@@ -155,12 +155,46 @@ void RequestParser::handleRequestLine() {
     return;
   }
 
-  // Drop any query string; none of these endpoints take parameters.
+  // Split off the query string. Only /v1/log takes one -- `?since=<seq>` --
+  // and anything else is ignored, exactly as before.
   size_t pathLen = targetLen;
+  size_t queryStart = targetLen;
   for (size_t i = 0; i < targetLen; ++i) {
-    if (target[i] == '?' || target[i] == '#') {
+    if (target[i] == '?') {
+      pathLen = i;
+      queryStart = i + 1;
+      break;
+    }
+    if (target[i] == '#') {
       pathLen = i;
       break;
+    }
+  }
+
+  if (queryStart < targetLen) {
+    // Look for "since=" among &-separated pairs. Deliberately minimal: this
+    // is the only query parameter the firmware understands.
+    const char* q = target + queryStart;
+    size_t qLen = targetLen - queryStart;
+    for (size_t i = 0; i < qLen; ) {
+      size_t end = i;
+      while (end < qLen && q[end] != '&' && q[end] != '#') {
+        ++end;
+      }
+      const size_t pairLen = end - i;
+      if (pairLen > 6 && strncmp(q + i, "since=", 6) == 0) {
+        req_.sincePresent = true;
+        uint32_t parsed = 0;
+        if (parseUint32(q + i + 6, pairLen - 6, parsed)) {
+          req_.since = parsed;
+        } else {
+          req_.sinceMalformed = true;
+        }
+      } else if (pairLen == 6 && strncmp(q + i, "since=", 6) == 0) {
+        req_.sincePresent = true;
+        req_.sinceMalformed = true;   // "since=" with no value
+      }
+      i = end + 1;
     }
   }
 
@@ -275,6 +309,7 @@ Route resolveRoute(HttpMethod method, const char* path) {
   };
   static const Entry table[] = {
       {"/v1/status",       HttpMethod::GET,  RouteAction::STATUS,  CommandType::NONE},
+      {"/v1/log",          HttpMethod::GET,  RouteAction::LOG,     CommandType::NONE},
       {"/v1/start",        HttpMethod::POST, RouteAction::COMMAND, CommandType::START},
       {"/v1/stop",         HttpMethod::POST, RouteAction::COMMAND, CommandType::STOP},
       {"/v1/start-failed", HttpMethod::POST, RouteAction::COMMAND, CommandType::START_FAILED},
@@ -570,6 +605,60 @@ size_t buildErrorJson(char* buf, size_t cap,
       code, message, static_cast<unsigned>(status), stateField, cooldownField);
 
   return finish(buf, cap, written);
+}
+
+size_t buildLogJson(char* buf, size_t cap,
+                    const LogEntry* entries, size_t count,
+                    uint32_t nextSeq, uint32_t oldestSeq, uint32_t dropped,
+                    bool truncated) {
+  if (buf == nullptr || cap == 0) {
+    return 0;
+  }
+
+  int n = snprintf(buf, cap,
+                   "{\"next\":%lu,\"oldest\":%lu,\"dropped\":%lu,"
+                   "\"truncated\":%s,\"count\":%lu,\"entries\":[",
+                   static_cast<unsigned long>(nextSeq),
+                   static_cast<unsigned long>(oldestSeq),
+                   static_cast<unsigned long>(dropped),
+                   jsonBool(truncated),
+                   static_cast<unsigned long>(count));
+  if (n < 0 || static_cast<size_t>(n) >= cap) {
+    buf[0] = '\0';
+    return 0;
+  }
+  size_t used = static_cast<size_t>(n);
+
+  for (size_t i = 0; i < count; ++i) {
+    const LogEntry& e = entries[i];
+    // Positional tuple, documented in PI_INTEGRATION.md:
+    //   [seq, uptime_ms, event, state, detail, relay_bits]
+    n = snprintf(buf + used, cap - used,
+                 "%s[%lu,%lu,\"%s\",\"%s\",%u,%u]",
+                 (i == 0) ? "" : ",",
+                 static_cast<unsigned long>(e.seq),
+                 static_cast<unsigned long>(e.uptimeMs),
+                 toString(static_cast<LogEvent>(e.event)),
+                 toString(static_cast<PumpState>(e.state)),
+                 static_cast<unsigned>(e.detail),
+                 static_cast<unsigned>(e.flags));
+    if (n < 0 || static_cast<size_t>(n) >= cap - used) {
+      // Should not happen -- the caller caps count at LOG_MAX_PER_RESPONSE --
+      // but never emit a torn document.
+      buf[0] = '\0';
+      return 0;
+    }
+    used += static_cast<size_t>(n);
+  }
+
+  if (used + 3 >= cap) {
+    buf[0] = '\0';
+    return 0;
+  }
+  buf[used++] = ']';
+  buf[used++] = '}';
+  buf[used] = '\0';
+  return used;
 }
 
 const char* reasonPhrase(uint16_t status) {

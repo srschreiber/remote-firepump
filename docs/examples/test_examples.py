@@ -411,6 +411,56 @@ def main() -> int:
         except ValueError:
             check("an unknown relay name is rejected client-side", True)
 
+        # -- event log --------------------------------------------------------
+        print("\n[event log]")
+        batch = pump.drain_log(0)
+        check("the log has entries", len(batch.entries) > 0,
+              f"{len(batch.entries)} entries")
+        check("nothing was dropped", batch.dropped == 0, str(batch.dropped))
+
+        events = [e.event for e in batch.entries]
+        states = [e.state for e in batch.entries]
+        check("boot was recorded", "BOOT" in events)
+        check("commands were recorded", "CMD" in events)
+        check("state changes were recorded", "STATE" in events)
+        for expected in ("PRIMING", "CRANKING", "RUNNING_ASSUMED", "STOPPING"):
+            check(f"the log shows {expected}", expected in states,
+                  str(sorted(set(states))))
+
+        # THE property: reads are non-destructive, so a Pi that crashes after
+        # receiving a batch but before writing it can just ask again.
+        again = pump.drain_log(0)
+        check("re-reading the same cursor returns the same entries",
+              [e.seq for e in batch.entries] == [e.seq for e in again.entries])
+        check("re-reading did not consume anything",
+              len(again.entries) == len(batch.entries))
+
+        # A cursor at the end yields nothing new.
+        tail = pump.fetch_log(batch.next)
+        check("a cursor at the end returns no entries", len(tail.entries) == 0)
+        check("next does not move when there is nothing new",
+              tail.next == batch.next, f"{tail.next} vs {batch.next}")
+
+        # Entries decode into something a human can read.
+        sample = batch.entries[0]
+        check("entries carry a relay snapshot",
+              set(sample.relays) == {"starter", "choke", "kill", "valve"},
+              str(sample.relays))
+        check("entries describe themselves", len(sample.describe()) > 0,
+              sample.describe())
+
+        # A malformed cursor is a client bug, not a silent zero.
+        try:
+            pump._request("GET", "/v1/log?since=nope")
+            check("a malformed since is rejected", False)
+        except PumpClientBug:
+            check("a malformed since is rejected", True)
+        try:
+            pump.fetch_log(-1)
+            check("a negative cursor is rejected client-side", False)
+        except ValueError:
+            check("a negative cursor is rejected client-side", True)
+
         # -- leave it safe ----------------------------------------------------
         settle_to_idle(pump)
         check("final state is IDLE", pump.status().state == "IDLE")

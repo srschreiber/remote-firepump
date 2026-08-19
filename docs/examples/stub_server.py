@@ -52,6 +52,9 @@ MAX_CRANK_MS = 5000
 VALVE_PRIME_MS = 5000
 VALVE_CLOSE_DELAY_MS = 3000
 
+LOG_RING_ENTRIES = 128
+LOG_MAX_PER_RESPONSE = 20
+
 MAX_CHOKE_PREP_OVERRIDE_MS = 15000
 MAX_UNCHOKE_DELAY_OVERRIDE_MS = 5000
 
@@ -78,6 +81,15 @@ MAX_REQUEST_LINE = 256
 MAX_HEADER_BYTES = 2048
 
 
+STATES = ("UNKNOWN", "IDLE", "PRIMING", "CHOKING", "CRANKING", "UNCHOKING",
+          "RUNNING_ASSUMED", "STOPPING", "VALVE_CLOSING", "RETRY_WAIT",
+          "FAULT")
+COMMANDS = ("NONE", "START", "STOP", "START_FAILED", "RESET_IDLE",
+            "MAINT_CHOKE_ON", "MAINT_CHOKE_OFF", "MAINT_STARTER_ON",
+            "MAINT_STARTER_OFF", "MAINT_KILL_ON", "MAINT_KILL_OFF",
+            "MAINT_VALVE_ON", "MAINT_VALVE_OFF")
+
+
 def now_ms() -> int:
     return int(time.monotonic() * 1000)
 
@@ -102,17 +114,55 @@ class PumpModel:
         self.last_starter_release_at = None
         self.last_command = None
         self._ring: list[tuple[str, str, int, bool]] = []   # id, cmd, status, accepted
+        # Event ring, read non-destructively with a cursor -- see event_log.h.
+        self._log: list[list] = []
+        self._log_next_seq = 0
+        self._log_dropped = 0
         self.timings = {"choke_prep_ms": CHOKE_PREP_MS,
                         "crank_ms": CRANK_DURATION_MS,
                         "unchoke_delay_ms": UNCHOKE_DELAY_MS}
 
     # -- helpers -----------------------------------------------------------
 
+    # -- event log ---------------------------------------------------------
+
+    def log_event(self, event: str, detail: int = 0, flag: bool = False) -> None:
+        """Append one entry. Overwrites the oldest when full and counts it."""
+        flags = 1 if flag else 0
+        for name, bit in (("starter", 0x10), ("choke", 0x20),
+                          ("kill", 0x40), ("valve", 0x80)):
+            if self.relays.get(name):
+                flags |= bit
+        entry = [self._log_next_seq, now_ms() - self.boot_at, event,
+                 self.state, detail, flags]
+        self._log_next_seq += 1
+        self._log.append(entry)
+        if len(self._log) > LOG_RING_ENTRIES:
+            self._log.pop(0)
+            self._log_dropped += 1
+
+    def drain_log(self, since: int) -> dict:
+        with self._lock:
+            batch = [e for e in self._log if e[0] >= since][:LOG_MAX_PER_RESPONSE]
+            next_seq = (batch[-1][0] + 1) if batch else self._log_next_seq
+            oldest = self._log[0][0] if self._log else self._log_next_seq
+            return {
+                "next": next_seq,
+                "oldest": oldest,
+                "dropped": self._log_dropped,
+                "truncated": next_seq != self._log_next_seq,
+                "count": len(batch),
+                "entries": batch,
+            }
+
     def _enter(self, state: str) -> None:
         if state != self.state:
             log.info("state %s -> %s", self.state, state)
+        prev = STATES.index(self.state) if self.state in STATES else 0
         self.state = state
         self.state_entered_at = now_ms()
+        if state != STATES[prev] if prev < len(STATES) else True:
+            self.log_event("STATE", prev, False)
 
     def _cooldown_remaining(self) -> int:
         if self.last_starter_release_at is None:
@@ -233,6 +283,9 @@ class PumpModel:
 
             self.last_command = {"type": cmd, "request_id": request_id or "",
                                  "accepted": accepted}
+            self.log_event("CMD",
+                           COMMANDS.index(cmd) if cmd in COMMANDS else 0,
+                           accepted)
 
             if accepted and request_id and not is_duplicate:
                 self._ring.append((request_id, cmd, status, accepted))
@@ -360,6 +413,7 @@ class PumpModel:
 
 ROUTES = {
     ("GET", "/v1/status"): None,
+    ("GET", "/v1/log"): "__LOG__",
     ("POST", "/v1/start"): "START",
     ("POST", "/v1/stop"): "STOP",
     ("POST", "/v1/start-failed"): "START_FAILED",
@@ -433,7 +487,13 @@ class Handler(BaseHTTPRequestHandler):
                         "missing or incorrect X-Pump-Secret", None)
             return
 
-        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        raw_path, _, raw_query = self.path.partition("?")
+        path = raw_path.split("#", 1)[0]
+        query = {}
+        for pair in raw_query.split("#", 1)[0].split("&"):
+            if "=" in pair:
+                k, _, v = pair.partition("=")
+                query[k] = v
         state = self.model.status()["state"]
 
         routes = active_routes()
@@ -452,6 +512,16 @@ class Handler(BaseHTTPRequestHandler):
         cmd = routes[key]
         if cmd is None:
             self._send(200, self.model.status())
+            return
+
+        if cmd == "__LOG__":
+            raw_since = query.get("since")
+            if raw_since is not None and not UINT32_RE.match(raw_since):
+                self._error(400, "invalid_since",
+                            "since must be a plain decimal sequence number",
+                            state)
+                return
+            self._send(200, self.model.drain_log(int(raw_since or 0)))
             return
 
         rid = self.headers.get("X-Request-ID")
@@ -513,6 +583,7 @@ def serve(port: int, secret: str, host: str = "127.0.0.1",
     WATER_OK = water_ok
 
     model = PumpModel()
+    model.log_event("BOOT", 0, False)
 
     handler = type("BoundHandler", (Handler,), {"model": model, "secret": secret})
     httpd = ThreadingHTTPServer((host, port), handler)

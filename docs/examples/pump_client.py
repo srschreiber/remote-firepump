@@ -170,6 +170,114 @@ class Timings:
         return self.kill_hold_ms + close
 
 
+# Relay bits packed into the top nibble of each entry's flags byte.
+_RELAY_BITS = (("starter", 0x10), ("choke", 0x20), ("kill", 0x40),
+               ("valve", 0x80))
+
+# detail-field decoders, by event name.
+_RELAY_NAMES = ("starter", "choke", "kill", "valve")
+_SAFETY_NAMES = ("starter_refused_kill", "starter_refused_unprimed",
+                 "starter_forced_off", "choke_forced_off",
+                 "valve_close_refused", "valve_reopened")
+_NET_NAMES = ("associating", "associated", "got_address", "link_lost",
+              "dhcp_timeout")
+_STATES = ("UNKNOWN", "IDLE", "PRIMING", "CHOKING", "CRANKING", "UNCHOKING",
+           "RUNNING_ASSUMED", "STOPPING", "VALVE_CLOSING", "RETRY_WAIT",
+           "FAULT")
+_COMMANDS = ("NONE", "START", "STOP", "START_FAILED", "RESET_IDLE",
+             "MAINT_CHOKE_ON", "MAINT_CHOKE_OFF", "MAINT_STARTER_ON",
+             "MAINT_STARTER_OFF", "MAINT_KILL_ON", "MAINT_KILL_OFF",
+             "MAINT_VALVE_ON", "MAINT_VALVE_OFF")
+_FAULTS = ("NONE", "STARTER_KILL_CONFLICT", "STARTER_OVERRUN",
+           "CHOKE_OVERRUN", "VALVE_CLOSED_WHILE_RUNNING", "WATER_LOST",
+           "ILLEGAL_TRANSITION")
+
+
+def _name(table: tuple, index: int) -> str:
+    return table[index] if 0 <= index < len(table) else f"?{index}"
+
+
+@dataclass(frozen=True)
+class LogRecord:
+    """One decoded event from the device ring.
+
+    The device stores 12 fixed bytes per entry and emits positional tuples;
+    all the human-readable expansion happens here, where there is a real disk
+    and no memory pressure.
+    """
+    seq: int
+    uptime_ms: int
+    event: str
+    state: str
+    detail: int
+    flags: int
+
+    @property
+    def relays(self) -> dict:
+        """Relay snapshot carried by every entry."""
+        return {name: bool(self.flags & bit) for name, bit in _RELAY_BITS}
+
+    @property
+    def flag(self) -> bool:
+        """Event-specific boolean: relay level, command accepted, water ok."""
+        return bool(self.flags & 0x01)
+
+    def describe(self) -> str:
+        """A log line a human can read."""
+        if self.event == "RELAY":
+            name = _name(_RELAY_NAMES, self.detail)
+            if name == "kill":
+                # Inverted by wiring: "on" means the engine is inhibited.
+                return f"kill {'ASSERTED' if self.flag else 'released'}"
+            if name == "valve":
+                return f"intake {'OPEN' if self.flag else 'shut'}"
+            return f"{name} {'ON' if self.flag else 'off'}"
+        if self.event == "STATE":
+            return f"{_name(_STATES, self.detail)} -> {self.state}"
+        if self.event == "CMD":
+            verdict = "accepted" if self.flag else "REFUSED"
+            return f"{_name(_COMMANDS, self.detail)} {verdict}"
+        if self.event == "FAULT":
+            return f"fault {_name(_FAULTS, self.detail)}"
+        if self.event == "SAFETY":
+            return f"interlock {_name(_SAFETY_NAMES, self.detail)}"
+        if self.event == "WATER":
+            return "water available" if self.detail else "WATER LOST"
+        if self.event == "NET":
+            return f"wifi {_name(_NET_NAMES, self.detail)}"
+        if self.event == "BOOT":
+            return "controller booted"
+        return f"{self.event} detail={self.detail}"
+
+    def __str__(self) -> str:
+        return (f"[{self.seq:>6}] +{self.uptime_ms/1000:9.3f}s "
+                f"{self.state:<16} {self.describe()}")
+
+
+@dataclass(frozen=True)
+class LogBatch:
+    next: int
+    oldest: int
+    dropped: int
+    truncated: bool
+    entries: list
+
+    @classmethod
+    def from_json(cls, body: dict) -> "LogBatch":
+        rows = []
+        for t in body.get("entries", []):
+            if not isinstance(t, (list, tuple)) or len(t) < 6:
+                continue
+            rows.append(LogRecord(seq=int(t[0]), uptime_ms=int(t[1]),
+                                  event=str(t[2]), state=str(t[3]),
+                                  detail=int(t[4]), flags=int(t[5])))
+        return cls(next=int(body.get("next", 0)),
+                   oldest=int(body.get("oldest", 0)),
+                   dropped=int(body.get("dropped", 0)),
+                   truncated=bool(body.get("truncated", False)),
+                   entries=rows)
+
+
 @dataclass(frozen=True)
 class PumpStatus:
     device: str
@@ -425,6 +533,48 @@ class PumpClient:
             f"{self.retries} attempts: {last_exc}") from last_exc
 
     # -- API ---------------------------------------------------------------
+
+    def fetch_log(self, since: int = 0) -> "LogBatch":
+        """GET /v1/log?since=<seq> -- drain the device's event ring.
+
+        Reads are NON-DESTRUCTIVE. The device keeps entries until they are
+        overwritten; you "flush" simply by advancing your cursor. That means a
+        crash between receiving a batch and writing it to disk costs nothing:
+        request the same `since` again and you get the same entries.
+
+        `batch.dropped` is the device's running count of entries overwritten
+        before anyone read them. If it grows, you are polling too slowly --
+        it never lies about a gap.
+
+        Returns at most LOG_MAX_PER_RESPONSE entries; `batch.truncated` says
+        there are more waiting, so keep calling with `batch.next`.
+        """
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            raise ValueError(f"since must be a non-negative integer, got {since!r}")
+        body = self._request("GET", f"/v1/log?since={since}")
+        return LogBatch.from_json(body)
+
+    def drain_log(self, since: int = 0, max_pages: int = 50) -> "LogBatch":
+        """Pages through fetch_log() until the device has nothing more.
+
+        Bounded by `max_pages` so a device producing entries faster than we
+        read can never spin here forever.
+        """
+        entries: list[LogRecord] = []
+        cursor = since
+        last: Optional[LogBatch] = None
+        for _ in range(max_pages):
+            last = self.fetch_log(cursor)
+            entries.extend(last.entries)
+            if not last.truncated or last.next == cursor:
+                break
+            cursor = last.next
+        if last is None:
+            return LogBatch(next=since, oldest=since, dropped=0,
+                            truncated=False, entries=[])
+        return LogBatch(next=last.next, oldest=last.oldest,
+                        dropped=last.dropped, truncated=last.truncated,
+                        entries=entries)
 
     def status(self) -> PumpStatus:
         """GET /v1/status. Safe to call as often as your poll budget allows."""

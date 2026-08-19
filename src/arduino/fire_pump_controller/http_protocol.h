@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "config.h"
+#include "event_log.h"
 #include "pump_controller.h"
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,11 @@ struct ParsedRequest {
   uint32_t chokeMs   = 0;
   uint32_t crankMs   = 0;
   uint32_t unchokeMs = 0;
+
+  // GET /v1/log?since=<seq>. The one endpoint that takes a query parameter.
+  bool     sincePresent = false;
+  bool     sinceMalformed = false;
+  uint32_t since = 0;
 
   bool anyTimingOverride() const {
     return chokeMsPresent || crankMsPresent || unchokeMsPresent;
@@ -130,6 +136,7 @@ class RequestParser {
 
 enum class RouteAction : uint8_t {
   STATUS = 0,   // GET /v1/status
+  LOG,          // GET /v1/log
   COMMAND,      // a state-changing endpoint
   ERROR_STATUS, // 404 / 405
 };
@@ -212,6 +219,20 @@ size_t buildErrorJson(char* buf, size_t cap,
                       uint16_t status, const char* code, const char* message,
                       const char* state /* may be nullptr */,
                       uint32_t cooldownRemainingMs, bool includeCooldown);
+
+// Serialises a drained batch of log entries.
+//
+// Entries are emitted as positional tuples, not objects:
+//
+//   [seq, uptime_ms, "event", "state", detail, relay_bits]
+//
+// which is about a third the size of the equivalent object form and lets a
+// full batch fit in one bounded response. The Pi expands them; the tuple
+// order is fixed and documented in PI_INTEGRATION.md.
+size_t buildLogJson(char* buf, size_t cap,
+                    const LogEntry* entries, size_t count,
+                    uint32_t nextSeq, uint32_t oldestSeq, uint32_t dropped,
+                    bool truncated);
 
 // Standard reason phrase for the status codes this server emits.
 const char* reasonPhrase(uint16_t status);
