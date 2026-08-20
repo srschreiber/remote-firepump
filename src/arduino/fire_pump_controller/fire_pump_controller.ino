@@ -21,6 +21,7 @@
 #include <Arduino.h>
 
 #include "api_handler.h"
+#include "battery.h"
 #include "config.h"
 #include "fault_handler.h"
 #include "http_server.h"
@@ -142,6 +143,7 @@ void setup() {
   g_matrix.begin();
   g_console.begin();
   tankLevel().begin(millis());
+  battery().begin(millis());
 
   g_net.begin(millis());
   g_http.begin();
@@ -210,6 +212,11 @@ void loop() {
   // Diagnostic only, and deliberately after every safety-critical step: one
   // analogRead per sample interval, gating nothing.
   tankLevel().tick(now);
+
+  // Diagnostic only, and after every safety-critical step. `relaysActive`
+  // matters: a resting voltage measured while a coil is drawing is not a
+  // resting voltage.
+  battery().tick(now, g_pump.state(), !g_pump.isQuiescent());
 
   // Cosmetic status display. Last, so it can never delay anything that
   // matters, and rate-limited internally to a frame every ~100 ms.

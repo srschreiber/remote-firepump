@@ -100,6 +100,13 @@ class FakeSerial {
   void print(unsigned v) { char b[16]; snprintf(b, sizeof(b), "%u", v); emit(b); }
   void print(long v) { char b[24]; snprintf(b, sizeof(b), "%ld", v); emit(b); }
   void print(unsigned long v) { char b[24]; snprintf(b, sizeof(b), "%lu", v); emit(b); }
+  // The real Arduino Serial takes an optional decimal-places argument for
+  // floats. Mirrored here so firmware diagnostics compile unchanged.
+  void print(double v, int places = 2) {
+    char b[32];
+    snprintf(b, sizeof(b), "%.*f", places, v);
+    emit(b);
+  }
 
   void println() { emit("\n"); }
   void println(const char* s) { emit(s); emit("\n"); }

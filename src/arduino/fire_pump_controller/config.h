@@ -251,6 +251,71 @@ static_assert(!INTAKE_VALVE_ENABLED || WATER_INTERLOCK_REQUIRED ||
 
 
 // ---------------------------------------------------------------------------
+// Battery voltage monitor (A1) -- DIAGNOSTIC ONLY
+// ---------------------------------------------------------------------------
+//
+// A "Voltage Sensor Module 0-25V" (30k/7.5k divider, 5:1) from the 12 V
+// battery to A1. Answers the only question that matters about a fire pump
+// battery: will it still crank?
+//
+// This gates NOTHING. A flat battery does not refuse a start -- if there is a
+// fire you crank anyway and find out. See battery.h.
+//
+// DEFAULT 0: no divider fitted yet. Set to 1 once wired.
+#ifndef ENABLE_BATTERY_MONITOR
+#define ENABLE_BATTERY_MONITOR 0
+#endif
+
+constexpr bool BATTERY_MONITOR_ENABLED = (ENABLE_BATTERY_MONITOR != 0);
+
+constexpr uint8_t PIN_BATTERY_VOLTS = A1;
+
+// Divider ratio: battery volts per volt at the pin.
+//
+// CALIBRATE THIS. The module's resistors are 5% parts, so the real ratio is
+// somewhere around 4.7 to 5.3, and the difference is roughly half a volt at
+// 12 V -- which on a lead-acid resting table is the whole distance between
+// "fine" and "replace it".
+//
+//   ratio = (voltage measured with a multimeter) / (voltage reported at the pin)
+constexpr float BATTERY_DIVIDER_RATIO = 5.0f;
+
+constexpr uint8_t BATTERY_ADC_BITS       = 14;
+constexpr float   BATTERY_ADC_MAX_COUNTS = 16383.0f;
+constexpr float   BATTERY_ADC_REF_MV     = 5000.0f;
+
+// Sampling. Slow when idle; fast during a crank, because the sag lasts about
+// two seconds and its minimum is the entire measurement.
+constexpr uint32_t BATTERY_SAMPLE_INTERVAL_MS = 2000;
+constexpr uint32_t BATTERY_CRANK_SAMPLE_MS    = 20;
+
+// Exponential smoothing factor for the live reading, 0..1. Lower is smoother.
+// The crank minimum deliberately bypasses this.
+constexpr float BATTERY_SMOOTHING = 0.2f;
+
+// How long the system must be quiet before a reading counts as "resting".
+//
+// Lead-acid holds a surface charge after charging and recovers slowly after a
+// load, so a reading taken too soon is high or low by a few tenths and looks
+// perfectly plausible. Ten minutes is a compromise: a proper resting figure
+// wants hours, but a number that never appears is not useful either.
+constexpr uint32_t BATTERY_REST_SETTLE_MS = 10UL * 60UL * 1000UL;
+
+// Resting voltage below which the battery is reported as low. 12.2 V is
+// roughly 50% charge; below that a lead-acid battery is both less able to
+// crank and actively sulphating.
+constexpr float BATTERY_LOW_VOLTS = 12.2f;
+
+// Crank minimum below which the battery is weak. Under 9.6 V a lead-acid
+// battery is at the edge of what an engine ECU or a cold start tolerates.
+constexpr float BATTERY_WEAK_CRANK_VOLTS = 9.6f;
+
+static_assert(BATTERY_DIVIDER_RATIO > 1.0f,
+              "the divider must step the battery voltage DOWN");
+static_assert(BATTERY_SMOOTHING > 0.0f && BATTERY_SMOOTHING <= 1.0f,
+              "smoothing factor must be in (0, 1]");
+
+// ---------------------------------------------------------------------------
 // Tank level sensor (A0) -- DIAGNOSTIC ONLY
 // ---------------------------------------------------------------------------
 //

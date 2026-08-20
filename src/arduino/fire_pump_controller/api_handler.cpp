@@ -2,6 +2,7 @@
 
 #include "api_handler.h"
 
+#include "battery.h"
 #include "tank_level.h"
 
 #include <string.h>
@@ -47,6 +48,13 @@ void makeStatusView(StatusView& v,
   v.valve   = pump.valveActive();
   v.valveEnabled = INTAKE_VALVE_ENABLED;
   v.waterOk = pump.waterOk();
+  const BatteryMonitor& batt = battery();
+  v.batteryVolts         = batt.volts();
+  v.batteryRestingValid  = batt.restingValid();
+  v.batteryRestingVolts  = batt.restingVolts();
+  v.batteryCrankMinVolts = batt.lastCrankMinVolts();
+  v.batteryLow           = batt.restingLow();
+
   const TankLevel& tank = tankLevel();
   v.tankStatus    = toString(tank.status());
   v.tankTrend     = toString(tank.trend());

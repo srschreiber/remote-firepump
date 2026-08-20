@@ -28,11 +28,13 @@ sources=(
   "$here/test_event_log.cpp"
   "$here/test_danger_override.cpp"
   "$here/test_tank_level.cpp"
+  "$here/test_battery.cpp"
   "$fw/pump_controller.cpp"
   "$fw/http_protocol.cpp"
   "$fw/api_handler.cpp"
   "$fw/event_log.cpp"
   "$fw/tank_level.cpp"
+  "$fw/battery.cpp"
 )
 
 # NOTE: -Wuseless-cast is deliberately NOT enabled. The rollover-safe idiom
@@ -73,7 +75,7 @@ for polarity in true false; do
     "$CXX" "${common[@]}" "-DRELAY_ACTIVE_LOW_OVERRIDE=$polarity" \
            "-DENABLE_MAINTENANCE_API=$maint" \
            "-DREQUIRE_WATER_INTERLOCK=$water" \
-           "-DENABLE_TANK_LEVEL=1" "${sources[@]}" -o "$exe"
+           "-DENABLE_TANK_LEVEL=1" -DENABLE_BATTERY_MONITOR=1 "${sources[@]}" -o "$exe"
 
     echo "=== running host tests ($name) ==="
     if ! "$exe" "$@"; then

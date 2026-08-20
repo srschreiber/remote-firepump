@@ -544,6 +544,9 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
     }
   }
 
+  char battVBuf[12];
+  char battRBuf[12];
+  char battCBuf[12];
   char tankVolBuf[12];
   char tankFlowBuf[12];
   char tankMaBuf[12];
@@ -561,6 +564,8 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       "\"relay_outputs\":{\"starter\":%s,\"choke\":%s,\"kill\":%s,\"valve\":%s},"
       "\"water_ok\":%s,\"water_sensor_fitted\":%s,"
       "\"kill_relay_fail_safe_nc\":%s,"
+      "\"battery\":{\"fitted\":%s,\"volts\":%s,\"resting_valid\":%s,"
+      "\"resting_volts\":%s,\"crank_min_volts\":%s,\"low\":%s},"
       "\"tank\":{\"fitted\":%s,\"status\":\"%s\",\"trend\":\"%s\","
       "\"level_mm\":%ld,\"volume_l\":%s,\"flow_lpm\":%s,\"volts\":%s},"
       "\"intake_valve_enabled\":%s,"
@@ -582,6 +587,12 @@ size_t buildStatusJson(char* buf, size_t cap, const StatusView& v) {
       jsonBool(v.starter), jsonBool(v.choke), jsonBool(v.kill), jsonBool(v.valve),
       jsonBool(v.waterOk), jsonBool(v.waterSensorFitted),
       jsonBool(v.killFailSafeNC),
+      jsonBool(v.batteryFitted),
+      fmt1(battVBuf, sizeof(battVBuf), v.batteryVolts),
+      jsonBool(v.batteryRestingValid),
+      fmt1(battRBuf, sizeof(battRBuf), v.batteryRestingVolts),
+      fmt1(battCBuf, sizeof(battCBuf), v.batteryCrankMinVolts),
+      jsonBool(v.batteryLow),
       jsonBool(v.tankFitted), v.tankStatus, v.tankTrend,
       static_cast<long>(v.tankLevelMm),
       fmt1(tankVolBuf, sizeof(tankVolBuf), v.tankVolumeL),

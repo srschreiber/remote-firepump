@@ -200,6 +200,15 @@ struct StatusView {
   // Tank level. Diagnostic only -- see tank_level.h. flowLpm is a MAGNITUDE;
   // tankTrend carries the direction, so a refilling tank never appears as a
   // negative flow.
+  // Battery. Diagnostic only -- see battery.h. restingValid distinguishes
+  // "settled and this is the number" from "not settled, ignore it".
+  bool  batteryFitted = BATTERY_MONITOR_ENABLED;
+  float batteryVolts = 0.0f;
+  bool  batteryRestingValid = false;
+  float batteryRestingVolts = 0.0f;
+  float batteryCrankMinVolts = 0.0f;
+  bool  batteryLow = false;
+
   bool        tankFitted = TANK_LEVEL_ENABLED;
   const char* tankStatus = "WARMING_UP";
   const char* tankTrend  = "UNKNOWN";
